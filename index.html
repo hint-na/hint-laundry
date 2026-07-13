@@ -7,6 +7,7 @@
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
 <script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
 <style>html,body{margin:0;padding:0;}</style>
 </head>
 <body>
@@ -350,6 +351,102 @@ function LaundryApp() {
     if (s) flash(`${s.name} removed. Existing orders keep it on their slips.`);
   };
 
+  /* ---------- price list: Excel import & export ---------- */
+  const priceFileInput = useRef(null);
+  const [importPreview, setImportPreview] = useState(null); // { rows, updated, added, skipped, fileName }
+  const parsePriceFile = (file) => {
+    if (typeof XLSX === "undefined") { flash("Excel support didn't load — check your internet connection and reload the app."); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const wb = XLSX.read(reader.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+        const norm = (v) => String(v).toLowerCase().replace(/[^a-z]/g, "");
+        let hi = -1, col = null;
+        for (let i = 0; i < Math.min(raw.length, 10); i++) {
+          const cells = (raw[i] || []).map(norm);
+          const iItem = cells.findIndex((c) => c === "item" || c === "itemname" || c === "service" || c === "name");
+          const iPrice = cells.findIndex((c) => c.startsWith("price"));
+          if (iItem >= 0 && iPrice >= 0) {
+            hi = i;
+            col = {
+              code: cells.findIndex((c) => c === "servicecode" || c === "code"),
+              item: iItem,
+              unit: cells.findIndex((c) => c === "unit"),
+              price: iPrice,
+              cat: cells.findIndex((c) => c === "category" || c === "cat"),
+            };
+            break;
+          }
+        }
+        if (!col) { flash("Couldn't find the header row — the file needs columns: Service Code, Item, Unit, Price (N$)."); return; }
+        const rows = []; let skipped = 0;
+        for (let i = hi + 1; i < raw.length; i++) {
+          const r = raw[i] || [];
+          if (!r.join("").trim()) continue; // blank row
+          const name = String(r[col.item] ?? "").trim();
+          const price = parseFloat(String(r[col.price] ?? "").replace(/[^\d.]/g, ""));
+          if (!name || isNaN(price) || price <= 0) { skipped++; continue; }
+          rows.push({
+            code: col.code >= 0 ? String(r[col.code] ?? "").trim() : "",
+            name,
+            unit: (col.unit >= 0 && String(r[col.unit] ?? "").trim()) || "per item",
+            price,
+            cat: (col.cat >= 0 && String(r[col.cat] ?? "").trim()) || "",
+          });
+        }
+        if (!rows.length) { flash("No usable rows found — check that Item and Price are filled in."); return; }
+        let updated = 0, added = 0;
+        const classified = rows.map((row) => {
+          const match = services.find((s) =>
+            (row.code && String(s.code || s.id).toLowerCase() === row.code.toLowerCase()) ||
+            s.name.toLowerCase() === row.name.toLowerCase());
+          if (match) { updated++; return { ...row, action: "update", targetId: match.id }; }
+          added++; return { ...row, action: "add" };
+        });
+        setImportPreview({ rows: classified, updated, added, skipped, fileName: file.name });
+      } catch (e) {
+        flash("Couldn't read that file — save it as .xlsx in Excel and try again.");
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+  const applyImport = () => {
+    if (!importPreview) return;
+    setServices((sv) => {
+      let next = [...sv];
+      importPreview.rows.forEach((row) => {
+        if (row.action === "update") {
+          next = next.map((s) => s.id === row.targetId
+            ? { ...s, name: row.name, unit: row.unit, price: row.price, code: row.code || s.code, cat: row.cat || s.cat }
+            : s);
+        } else {
+          next.push({ id: newKey(), code: row.code || undefined, name: row.name, unit: row.unit, price: row.price, icon: "🧼", cat: row.cat || "Garments" });
+        }
+      });
+      return next;
+    });
+    flash(`Price list imported — ${importPreview.updated} updated, ${importPreview.added} added${importPreview.skipped ? `, ${importPreview.skipped} skipped` : ""}.`);
+    setImportPreview(null);
+  };
+  const exportPriceList = () => {
+    if (typeof XLSX === "undefined") { flash("Excel support didn't load — check your internet connection and reload the app."); return; }
+    const data = services.map((s) => ({
+      "Service Code": String(s.code || s.id).toUpperCase(),
+      "Item": s.name,
+      "Unit": s.unit,
+      "Price (N$)": s.price,
+      "Category": s.cat || "",
+    }));
+    const ws = XLSX.utils.json_to_sheet(data);
+    ws["!cols"] = [{ wch: 12 }, { wch: 28 }, { wch: 10 }, { wch: 10 }, { wch: 12 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Price list");
+    XLSX.writeFile(wb, `hint-laundry-prices-${todayISO()}.xlsx`);
+    flash("Price list downloaded as Excel — edit it and import it back anytime.");
+  };
+
   /* ---------- team (users) management ---------- */
   const [userDraft, setUserDraft] = useState({ name: "", pin: "", role: "staff" });
   const addUser = () => {
@@ -464,7 +561,7 @@ function LaundryApp() {
         return;
       }
       cust = {
-        id: "C-" + (1000 + customers.length + 1),
+        id: nextCustomerId(customers),
         name: sel.name.trim(),
         phone: displayPhone(sel.phone),
         address: sel.address.trim() || "Oshikuku",
@@ -601,6 +698,25 @@ function LaundryApp() {
 
   /* ---------- edit customer ---------- */
   const [custEdit, setCustEdit] = useState(null); // { id, name, phone, address }
+  const [custDraft, setCustDraft] = useState({ name: "", phone: "", address: "" });
+  const nextCustomerId = (cs) => {
+    const maxN = cs.reduce((m, c) => {
+      const n = parseInt(String(c.id).replace(/\D/g, ""), 10);
+      return isNaN(n) ? m : Math.max(m, n);
+    }, 1000);
+    return "C-" + (maxN + 1);
+  };
+  const addCustomer = () => {
+    const name = custDraft.name.trim();
+    if (!name || !custDraft.phone.trim()) { flash("Enter the customer's name and phone."); return; }
+    if (!phoneLooksValid(custDraft.phone)) { flash("Check the phone number — just the local number, e.g. 0813886676."); return; }
+    const phone = displayPhone(custDraft.phone);
+    const dup = customers.find((c) => String(c.phone).replace(/\D/g, "") === phone.replace(/\D/g, ""));
+    if (dup) { flash(`That phone number is already registered to ${dup.name}.`); return; }
+    setCustomers((cs) => [...cs, { id: nextCustomerId(cs), name, phone, address: custDraft.address.trim() || "Oshikuku", ts: Date.now() }]);
+    setCustDraft({ name: "", phone: "", address: "" });
+    flash(`${name} added — they'll appear in the New order customer search.`);
+  };
   const [custTabQuery, setCustTabQuery] = useState("");
   const filteredCustomers = useMemo(() => {
     const q = custTabQuery.trim().toLowerCase();
@@ -739,8 +855,8 @@ function LaundryApp() {
       setCurrentUserId(user.id);
       setUnlocked(true); setPinError(""); setPinInput("");
       setTab("dash");
-      if (user.role === "admin" && Date.now() - lastBackupTs > 20 * 3600000) {
-        setTimeout(() => backupData(true), 400);
+      if (user.role === "admin" && Date.now() - lastBackupTs > 3 * 24 * 3600000) {
+        setTimeout(() => flash("Reminder: no recent backup — tap “Backup now” in Settings when you have a moment."), 600);
       }
     };
     return (
@@ -1246,7 +1362,17 @@ function LaundryApp() {
           {tab === "customers" && (
             <section className="panel">
               <h2>Customers</h2>
-              <p className="muted">New customers are registered on the “+ New order” screen during their first visit. Use Edit to fix a wrong name or phone number.</p>
+              <p className="muted">Register customers here or on the “+ New order” screen during their first visit. Use Edit to fix a wrong name or phone number.</p>
+              <div className="svc-cat">Add a customer</div>
+              <div className="edit-add">
+                <input value={custDraft.name} placeholder="Full name"
+                  onChange={(e) => setCustDraft({ ...custDraft, name: e.target.value })} />
+                <input value={custDraft.phone} placeholder="Phone, e.g. 0813886676" inputMode="tel" className="narrow"
+                  onChange={(e) => setCustDraft({ ...custDraft, phone: e.target.value })} />
+                <input value={custDraft.address} placeholder="Address (optional)"
+                  onChange={(e) => setCustDraft({ ...custDraft, address: e.target.value })} />
+                <button className="btn-main small" onClick={addCustomer}>Add</button>
+              </div>
               <div className="order-toolbar no-print">
                 <input className="search" value={custTabQuery} placeholder="Search name, phone or address…"
                   onChange={(e) => setCustTabQuery(e.target.value)} />
@@ -1350,6 +1476,40 @@ function LaundryApp() {
             <section className="panel">
               <h2>Price list</h2>
               <p className="muted">Type the new amount — it saves automatically and applies to new orders. Existing slips keep the price the customer was charged.</p>
+              <div className="edit-add" style={{ marginBottom: 14 }}>
+                <button className="btn-main small" onClick={() => priceFileInput.current && priceFileInput.current.click()}>⬆ Import price list (Excel)</button>
+                <button className="btn-ghost small" onClick={exportPriceList}>⬇ Download as Excel</button>
+                <input type="file" ref={priceFileInput} accept=".xlsx,.xls,.csv" style={{ display: "none" }}
+                  onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) parsePriceFile(f); e.target.value = ""; }} />
+              </div>
+              <p className="muted" style={{ marginTop: -6 }}>Excel columns: <strong>Service Code · Item · Unit · Price (N$)</strong> (Category optional). Items are matched by code or name — matches update the price, new ones are added. Tip: download the current list first and use it as your template.</p>
+              {importPreview && (
+                <div style={{ background: "#F0F6FF", border: "1px solid #BFDBFE", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+                  <strong>Import preview — {importPreview.fileName}</strong>
+                  <p className="muted" style={{ margin: "6px 0 10px" }}>
+                    {importPreview.updated} item(s) will be updated, {importPreview.added} new item(s) added
+                    {importPreview.skipped ? `, ${importPreview.skipped} row(s) skipped (missing name or price)` : ""}. Nothing changes until you press Apply.
+                  </p>
+                  <table className="table">
+                    <thead><tr><th>Code</th><th>Item</th><th>Unit</th><th>Price (N$)</th><th>Action</th></tr></thead>
+                    <tbody>
+                      {importPreview.rows.map((r, i) => (
+                        <tr key={i}>
+                          <td>{r.code || "—"}</td>
+                          <td>{r.name}</td>
+                          <td>{r.unit}</td>
+                          <td>{r.price}</td>
+                          <td><span className={"chip " + (r.action === "add" ? "role-admin" : "role-staff")}>{r.action === "add" ? "New" : "Update"}</span></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                    <button className="btn-main small" onClick={applyImport}>Apply import</button>
+                    <button className="btn-ghost small" onClick={() => setImportPreview(null)}>Cancel</button>
+                  </div>
+                </div>
+              )}
               <table className="table">
                 <thead><tr><th>Item</th><th>Unit</th><th>Price (N$)</th><th></th></tr></thead>
                 <tbody>
