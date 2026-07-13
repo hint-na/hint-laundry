@@ -1,0 +1,2183 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hint Laundry &amp; Dry Cleaners</title>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react/18.2.0/umd/react.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/react-dom/18.2.0/umd/react-dom.production.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/babel-standalone/7.23.5/babel.min.js"></script>
+<script src="https://cdnjs.cloudflare.com/ajax/libs/xlsx/0.18.5/xlsx.full.min.js"></script>
+<style>html,body{margin:0;padding:0;}</style>
+</head>
+<body>
+<div id="root"></div>
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useEffect, useRef } = React;
+const appStorage = (typeof window.storage !== 'undefined' && window.storage) ? window.storage : {
+  async get(key) { const v = localStorage.getItem(key); if (v === null) throw new Error('not found'); return { key, value: v }; },
+  async set(key, value) { localStorage.setItem(key, value); return { key, value }; },
+  async delete(key) { localStorage.removeItem(key); return { key, deleted: true }; },
+};
+
+
+/* ------------------------------------------------------------------ */
+/*  HINT LAUNDRY & DRY CLEANERS — Staff app, Version 2                 */
+/*  Oshikuku · Since 2015                                              */
+/*                                                                     */
+/*  V2 adds: edit & cancel orders · edit customers · custom items     */
+/*  · backup/restore · payment reversals · discounts · staff names    */
+/*  · garment tags on slips · WhatsApp slip/receipt/ready messages    */
+/*                                                                     */
+/*  QUICK SETTINGS:                                                    */
+/*  - ADMIN_PIN: change before staff use it                            */
+/*  - Prices: edit inside the app, Price list tab                      */
+/* ------------------------------------------------------------------ */
+
+const ADMIN_PIN = "1234";  // default owner PIN (manage users in the Team tab)
+const STAFF_PIN = "5678";  // default demo staff PIN
+
+/* Users: each person has their own PIN. Sign in = enter your PIN.
+   The owner can add or remove people in the Team tab. */
+const DEFAULT_USERS = [
+  { id: "u1", name: "Owner", pin: ADMIN_PIN, role: "admin" },
+  { id: "u2", name: "Demo staff", pin: STAFF_PIN, role: "staff" },
+];
+/* Default shop details live in DEFAULT_SETTINGS below — edit them in the app's Settings tab. */
+
+/* Phone numbers: staff type the local number (e.g. 0813886676) and the
+   app stores it as +264 81 388 6676 automatically. */
+const normalizePhone = (raw) => {
+  let d = String(raw).replace(/\D/g, "");
+  if (d.startsWith("00")) d = d.slice(2);
+  if (d.startsWith("264")) d = d.slice(3);
+  if (d.startsWith("0")) d = d.slice(1);
+  return "264" + d;
+};
+const displayPhone = (raw) => {
+  const d = normalizePhone(raw);
+  const rest = d.slice(3);
+  if (rest.length === 9) return "+264 " + rest.slice(0, 2) + " " + rest.slice(2, 5) + " " + rest.slice(5);
+  return "+264 " + rest;
+};
+const phoneLooksValid = (raw) => {
+  const rest = normalizePhone(raw).slice(3);
+  return rest.length >= 8 && rest.length <= 10;
+};
+
+const DEFAULT_SERVICES = [
+  { id: "ts", name: "T-shirt",              unit: "per item", price: 20,  icon: "👕", cat: "Garments" },
+  { id: "ls", name: "Long sleeve shirt",    unit: "per item", price: 25,  icon: "👔", cat: "Garments" },
+  { id: "tr", name: "Trouser / Skirt",      unit: "per item", price: 30,  icon: "👖", cat: "Garments" },
+  { id: "dr", name: "Dress",                unit: "per item", price: 45,  icon: "👗", cat: "Garments" },
+  { id: "bl", name: "Blazer",               unit: "per item", price: 50,  icon: "🧥", cat: "Garments" },
+  { id: "ja", name: "Jacket / Coat",        unit: "per item", price: 60,  icon: "🧥", cat: "Garments" },
+  { id: "su", name: "Complete suit",        unit: "per item", price: 80,  icon: "🤵", cat: "Garments" },
+  { id: "du", name: "Duvet / Blanket",      unit: "per item", price: 120, icon: "🛏️", cat: "Household" },
+  { id: "cu", name: "Curtains",             unit: "per item", price: 80,  icon: "🪟", cat: "Household" },
+  { id: "sn", name: "Sneaker cleaning",     unit: "per pair", price: 80,  icon: "👟", cat: "Household" },
+  { id: "p1", name: "Pillow case (single)", unit: "per item", price: 10,  icon: "🛌", cat: "Household" },
+  { id: "p2", name: "Pillow case (double)", unit: "per item", price: 15,  icon: "🛌", cat: "Household" },
+];
+
+const STATUSES = ["Received", "Cleaning", "Ready for collection", "Collected"];
+const DONE_STATUS = "Collected";
+const SLOTS = ["07:30 – 10:00", "10:00 – 13:00", "13:00 – 16:00", "16:00 – 18:00"]; // used by demo seed data
+
+/* Company details & message templates — editable in the Settings tab. */
+const DEFAULT_SETTINGS = {
+  shopName: "Hint Laundry & Dry Cleaners",
+  phone: "+264 81 388 6676",
+  location: "Oshikuku, Omusati Region",
+  hours: "Mon–Sat, 07:30 – 18:00",
+  payMethods: ["Cash", "Card", "Bank payment (EFT)"],
+  expressRate: 50,
+  slots: ["07:30 – 10:00", "10:00 – 13:00", "13:00 – 16:00", "16:00 – 18:00"],
+  turnaroundDays: 1,
+  policyDays: 30,
+  printFormat: "a4",
+  readyMsg: "Hi {name}! Your laundry order {order} is ready for collection at {shop}. {balance}Our hours: {hours}. See you soon!",
+  overdueMsg: "Hi {name}, this is {shop}. Your laundry order {order} has been ready since {date}. {balance}Please collect during our hours: {hours}. Thank you!",
+  thanksMsg: "Hi {name}, thank you for your payment on order {order}. {balance}— {shop}",
+  slipFooter: "Please keep this slip and present it when collecting your items. Items not collected within {days} days may be released. Thank you!",
+};
+const shopLine = (st) => `${st.location} · ${st.phone}`;
+
+const fmt = (n) => "N$" + Number(n).toFixed(2).replace(/\.00$/, "");
+
+/* Local-time date helpers (Namibia is UTC+2, so never use UTC dates) */
+const localISO = (d) => `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, "0")}-${String(d.getDate()).padStart(2, "0")}`;
+const todayISO = () => localISO(new Date());
+const tomorrowISO = () => { const d = new Date(); d.setDate(d.getDate() + 1); return localISO(d); };
+const daysAheadISO = (n) => { const d = new Date(); d.setDate(d.getDate() + Math.max(0, n)); return localISO(d); };
+
+/* ------------------------------------------------------------------ */
+/*  Automatic collection date & time rules:                            */
+/*  1. Saturday orders (any time)  → Monday, 14:00 – 15:00             */
+/*  2. Orders created 07:30–12:00  → next day, 13:00 – 14:00           */
+/*  3. All other orders            → +turnaround days, same time       */
+/* ------------------------------------------------------------------ */
+const computeCollection = (now, defaultDays = 1) => {
+  const addDays = (n) => { const d = new Date(now); d.setDate(d.getDate() + n); return localISO(d); };
+  if (now.getDay() === 6) {                              // Saturday → Monday
+    return { date: addDays(2), slot: "14:00 – 15:00" };
+  }
+  const mins = now.getHours() * 60 + now.getMinutes();
+  if (mins >= 450 && mins < 720) {                       // 07:30 – 12:00 → next day early afternoon
+    return { date: addDays(1), slot: "13:00 – 14:00" };
+  }
+  const hh = String(now.getHours()).padStart(2, "0");    // default: same time, +turnaround days
+  const mm = String(now.getMinutes()).padStart(2, "0");
+  return { date: addDays(Math.max(1, defaultDays)), slot: `${hh}:${mm}` };
+};
+const label = (ts) => new Date(ts).toLocaleString("en-GB", { day: "numeric", month: "short", year: "numeric", hour: "2-digit", minute: "2-digit" });
+const dateLabel = (ts) => new Date(ts).toLocaleDateString("en-GB", { day: "numeric", month: "short", year: "numeric" });
+const T = (s) => new Date(s).getTime();
+let uid = 1;
+const newKey = () => "x" + Date.now().toString(36) + (uid++);
+
+/* ----------------------------- demo seed ----------------------------- */
+const seedCustomers = [
+  { id: "C-1001", name: "Ndapewa Amutenya", phone: "+264 81 555 0192", address: "Erf 112, Oshikuku", ts: T("2026-07-03T09:12") },
+];
+
+const seedOrders = [
+  {
+    id: "HL-1041", customerId: "C-1001", customerName: "Ndapewa Amutenya", phone: "+264 81 555 0192",
+    items: [
+      { key: "s1", name: "Long sleeve shirt", qty: 3, price: 25 },
+      { key: "s2", name: "Trouser / Skirt", qty: 2, price: 30 },
+    ],
+    express: false, discount: 0, collectDate: "2026-07-05", collectSlot: SLOTS[2], notes: "",
+    subtotal: 135, expressFee: 0, total: 135,
+    status: DONE_STATUS, takenBy: "Demo",
+    statusHistory: [
+      { status: "Received", ts: T("2026-07-03T09:20"), by: "Demo" },
+      { status: "Cleaning", ts: T("2026-07-03T13:40"), by: "Demo" },
+      { status: "Ready for collection", ts: T("2026-07-04T16:10"), by: "Demo" },
+      { status: "Collected", ts: T("2026-07-05T15:02"), by: "Demo" },
+    ],
+    payments: [{ amount: 135, method: "Cash", ts: T("2026-07-05T15:03"), by: "Demo" }],
+    ts: T("2026-07-03T09:20"),
+  },
+  {
+    id: "HL-1042", customerId: "C-1001", customerName: "Ndapewa Amutenya", phone: "+264 81 555 0192",
+    items: [
+      { key: "s3", name: "Complete suit", qty: 1, price: 80 },
+      { key: "s4", name: "Dress", qty: 1, price: 45 },
+    ],
+    express: false, discount: 0, collectDate: "2026-07-06", collectSlot: SLOTS[3], notes: "Check suit's left sleeve for a stain.",
+    subtotal: 125, expressFee: 0, total: 125,
+    status: "Cleaning", takenBy: "Demo",
+    statusHistory: [
+      { status: "Received", ts: T("2026-07-05T11:02"), by: "Demo" },
+      { status: "Cleaning", ts: T("2026-07-05T14:15"), by: "Demo" },
+    ],
+    payments: [{ amount: 50, method: "Cash", ts: T("2026-07-05T11:50"), by: "Demo" }],
+    ts: T("2026-07-05T11:02"),
+  },
+];
+
+let orderSeq = 1043;
+const STORAGE_KEY = "hint-laundry-v2";
+
+/* ---------- money helpers ---------- */
+const paidOf = (o) => o.payments.reduce((a, p) => a + p.amount, 0);
+const payState = (o) => {
+  const p = paidOf(o);
+  if (p >= o.total) return "paid";
+  if (p > 0) return "partial";
+  return "unpaid";
+};
+const balanceOf = (o) => Math.max(0, o.total - paidOf(o));
+
+/* ---------- WhatsApp text builders ---------- */
+const waTo = (phone, text) => `https://wa.me/${String(phone).replace(/\D/g, "")}?text=${encodeURIComponent(text)}`;
+const slipText = (o, st) => {
+  const lines = o.items.map((it) => `- ${it.qty} x ${it.name} = ${fmt(it.price * it.qty)}`).join("\n");
+  return `*${st.shopName}* — Laundry slip\n\nOrder no: *${o.id}*\nDate: ${label(o.ts)}\nCustomer: ${o.customerName}\n\n${lines}\n${o.express ? `Express service: ${fmt(o.expressFee)}\n` : ""}${o.discount > 0 ? `Discount: -${fmt(o.discount)}\n` : ""}Total: *${fmt(o.total)}*\nPaid: ${fmt(paidOf(o))}\nBalance: *${fmt(balanceOf(o))}*\n\nCollection: ${o.collectDate}, ${o.collectSlot}\nPlease bring your slip or quote your order number when collecting. Thank you!`;
+};
+const receiptText = (o, st) => {
+  const lines = o.payments.map((p) => `- ${label(p.ts)}: ${fmt(p.amount)} (${p.method})`).join("\n");
+  return `${fillTpl(st.thanksMsg, o, st)}\n\n*${st.shopName}* — Receipt R-${o.id}-${o.payments.length}\nOrder no: *${o.id}*\n\n${lines}\n\nOrder total: ${fmt(o.total)}\nTotal paid: *${fmt(paidOf(o))}*\nBalance due: *${fmt(balanceOf(o))}*`;
+};
+const fillTpl = (tpl, o, st) => tpl
+  .replace(/{name}/g, o.customerName)
+  .replace(/{order}/g, o.id)
+  .replace(/{shop}/g, st.shopName)
+  .replace(/{hours}/g, st.hours)
+  .replace(/{date}/g, o.collectDate || "")
+  .replace(/{balance}/g, balanceOf(o) > 0 ? `Balance due: *${fmt(balanceOf(o))}*. ` : "It is fully paid. ");
+const readyText = (o, st) => fillTpl(st.readyMsg, o, st);
+const overdueText = (o, st) => fillTpl(st.overdueMsg, o, st);
+
+/* ------------------------------------------------------------------ */
+
+function LaundryApp() {
+  const [loaded, setLoaded] = useState(false);
+  const [unlocked, setUnlocked] = useState(false);
+  const [pinInput, setPinInput] = useState("");
+  const [currentStaff, setCurrentStaff] = useState("");
+  const [role, setRole] = useState("staff"); // 'admin' | 'staff'
+  const isAdmin = role === "admin";
+  const [pinError, setPinError] = useState("");
+
+  const [customers, setCustomers] = useState(seedCustomers);
+  const [orders, setOrders] = useState(seedOrders);
+  const [services, setServices] = useState(DEFAULT_SERVICES);
+  const [users, setUsers] = useState(DEFAULT_USERS);
+  const [settings, setSettings] = useState(DEFAULT_SETTINGS);
+  const [currentUserId, setCurrentUserId] = useState(null);
+  const [lastBackupTs, setLastBackupTs] = useState(0);
+
+  const [tab, setTab] = useState("dash");
+  const [toast, setToast] = useState(null);
+  const toastTimer = useRef(null);
+  const flash = (msg) => {
+    setToast(msg);
+    clearTimeout(toastTimer.current);
+    toastTimer.current = setTimeout(() => setToast(null), 3400);
+  };
+  useEffect(() => () => clearTimeout(toastTimer.current), []);
+
+  const [printing, setPrinting] = useState(null);   // { type: 'slip'|'receipt', orderId }
+  const [edit, setEdit] = useState(null);           // edit-order draft
+  const [cancelDraft, setCancelDraft] = useState(null); // { orderId, reason }
+  const restoreInput = useRef(null);
+
+  /* ---------- persistence ---------- */
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await appStorage.get(STORAGE_KEY);
+        if (res?.value) {
+          const s = JSON.parse(res.value);
+          if (Array.isArray(s.customers)) setCustomers(s.customers);
+          if (Array.isArray(s.orders)) setOrders(s.orders);
+          if (Array.isArray(s.services)) setServices(s.services);
+          if (Array.isArray(s.users) && s.users.length > 0) setUsers(s.users);
+          if (s.settings && typeof s.settings === "object") setSettings({ ...DEFAULT_SETTINGS, ...s.settings });
+          if (s.lastBackupTs) setLastBackupTs(s.lastBackupTs);
+          const maxOrder = (s.orders || []).reduce((m, o) => {
+            const n = parseInt(String(o.id).replace(/\D/g, ""), 10);
+            return isNaN(n) ? m : Math.max(m, n);
+          }, orderSeq - 1);
+          orderSeq = maxOrder + 1;
+        }
+      } catch (e) { /* first run — demo seed */ }
+      setLoaded(true);
+    })();
+  }, []);
+
+  useEffect(() => {
+    if (!loaded) return;
+    const t = setTimeout(async () => {
+      try {
+        await appStorage.set(STORAGE_KEY, JSON.stringify({ customers, orders, services, users, settings, lastBackupTs }));
+      } catch (e) { console.error("Save failed:", e); }
+    }, 400);
+    return () => clearTimeout(t);
+  }, [loaded, customers, orders, services, users, settings, lastBackupTs]);
+
+  const resetAllData = async () => {
+    try { await appStorage.delete(STORAGE_KEY); } catch (e) {}
+    setCustomers(seedCustomers);
+    setOrders(seedOrders);
+    setServices(DEFAULT_SERVICES);
+    setUsers(DEFAULT_USERS);
+    setSettings(DEFAULT_SETTINGS);
+    setLastBackupTs(0);
+    orderSeq = 1043;
+    flash("All data reset to the demo starting point.");
+  };
+
+  /* ---------- backup & restore ---------- */
+  const backupData = (auto = false) => {
+    const payload = { app: "hint-laundry", version: 2, exportedAt: new Date().toISOString(), customers, orders, services, users, settings };
+    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob);
+    a.download = `hint-laundry-backup-${todayISO()}.json`;
+    a.click();
+    URL.revokeObjectURL(a.href);
+    setLastBackupTs(Date.now());
+    flash(auto ? "Daily auto-backup downloaded — keep the file safe." : "Backup file downloaded — keep it somewhere safe.");
+  };
+  const restoreData = (file) => {
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const s = JSON.parse(reader.result);
+        if (!Array.isArray(s.customers) || !Array.isArray(s.orders) || !Array.isArray(s.services)) throw new Error("bad file");
+        setCustomers(s.customers);
+        setOrders(s.orders);
+        setServices(s.services);
+        if (Array.isArray(s.users) && s.users.length > 0) setUsers(s.users);
+        if (s.settings && typeof s.settings === "object") setSettings({ ...DEFAULT_SETTINGS, ...s.settings });
+        const maxOrder = s.orders.reduce((m, o) => {
+          const n = parseInt(String(o.id).replace(/\D/g, ""), 10);
+          return isNaN(n) ? m : Math.max(m, n);
+        }, 1042);
+        orderSeq = maxOrder + 1;
+        flash("Backup restored.");
+      } catch (e) {
+        flash("That file doesn't look like a Hint Laundry backup.");
+      }
+    };
+    reader.readAsText(file);
+  };
+
+  /* ---------- settings editors ---------- */
+  const [newMethod, setNewMethod] = useState("");
+  const [newSlot, setNewSlot] = useState("");
+  const previewOrder = { customerName: "Ndapewa", id: "HL-1050", payments: [], total: 125, collectDate: todayISO() };
+
+  /* ---------- price list management ---------- */
+  const [svcDraft, setSvcDraft] = useState({ name: "", price: "", unit: "per item", cat: "Garments" });
+  const addService = () => {
+    const name = svcDraft.name.trim();
+    const price = parseFloat(svcDraft.price);
+    if (!name) { flash("Give the item a name."); return; }
+    if (!price || price <= 0) { flash("Give the item a price."); return; }
+    if (services.some((s) => s.name.toLowerCase() === name.toLowerCase())) { flash("That item is already on the list."); return; }
+    setServices((sv) => [...sv, { id: newKey(), name, unit: svcDraft.unit, price, icon: "🧼", cat: svcDraft.cat }]);
+    setSvcDraft({ name: "", price: "", unit: "per item", cat: svcDraft.cat });
+    flash(`${name} added to the price list.`);
+  };
+  const removeService = (id) => {
+    const s = services.find((x) => x.id === id);
+    setServices((sv) => sv.filter((x) => x.id !== id));
+    setCart((c) => { const n = { ...c }; delete n[id]; return n; });
+    if (s) flash(`${s.name} removed. Existing orders keep it on their slips.`);
+  };
+
+  /* ---------- price list: Excel import & export ---------- */
+  const priceFileInput = useRef(null);
+  const [importPreview, setImportPreview] = useState(null); // { rows, updated, added, skipped, fileName }
+  const parsePriceFile = (file) => {
+    if (typeof XLSX === "undefined") { flash("Excel support didn't load — check your internet connection and reload the app."); return; }
+    const reader = new FileReader();
+    reader.onload = () => {
+      try {
+        const wb = XLSX.read(reader.result, { type: "array" });
+        const ws = wb.Sheets[wb.SheetNames[0]];
+        const raw = XLSX.utils.sheet_to_json(ws, { header: 1, defval: "" });
+        const norm = (v) => String(v).toLowerCase().replace(/[^a-z]/g, "");
+        let hi = -1, col = null;
+        for (let i = 0; i < Math.min(raw.length, 10); i++) {
+          const cells = (raw[i] || []).map(norm);
+          const iItem = cells.findIndex((c) => c === "item" || c === "itemname" || c === "service" || c === "name");
+          const iPrice = cells.findIndex((c) => c.startsWith("price"));
+          if (iItem >= 0 && iPrice >= 0) {
+            hi = i;
+            col = {
+              code: cells.findIndex((c) => c === "servicecode" || c === "code"),
+              item: iItem,
+              unit: cells.findIndex((c) => c === "unit"),
+              price: iPrice,
+              cat: cells.findIndex((c) => c === "category" || c === "cat"),
+            };
+            break;
+          }
+        }
+        if (!col) { flash("Couldn't find the header row — the file needs columns: Service Code, Item, Unit, Price (N$)."); return; }
+        const rows = []; let skipped = 0;
+        for (let i = hi + 1; i < raw.length; i++) {
+          const r = raw[i] || [];
+          if (!r.join("").trim()) continue; // blank row
+          const name = String(r[col.item] ?? "").trim();
+          const price = parseFloat(String(r[col.price] ?? "").replace(/[^\d.]/g, ""));
+          if (!name || isNaN(price) || price <= 0) { skipped++; continue; }
+          rows.push({
+            code: col.code >= 0 ? String(r[col.code] ?? "").trim() : "",
+            name,
+            unit: (col.unit >= 0 && String(r[col.unit] ?? "").trim()) || "per item",
+            price,
+            cat: (col.cat >= 0 && String(r[col.cat] ?? "").trim()) || "",
+          });
+        }
+        if (!rows.length) { flash("No usable rows found — check that Item and Price are filled in."); return; }
+        let updated = 0, added = 0;
+        const classified = rows.map((row) => {
+          const match = services.find((s) =>
+            (row.code && String(s.code || s.id).toLowerCase() === row.code.toLowerCase()) ||
+            s.name.toLowerCase() === row.name.toLowerCase());
+          if (match) { updated++; return { ...row, action: "update", targetId: match.id }; }
+          added++; return { ...row, action: "add" };
+        });
+        setImportPreview({ rows: classified, updated, added, skipped, fileName: file.name });
+      } catch (e) {
+        flash("Couldn't read that file — save it as .xlsx in Excel and try again.");
+      }
+    };
+    reader.readAsArrayBuffer(file);
+  };
+  const applyImport = () => {
+    if (!importPreview) return;
+    setServices((sv) => {
+      let next = [...sv];
+      importPreview.rows.forEach((row) => {
+        if (row.action === "update") {
+          next = next.map((s) => s.id === row.targetId
+            ? { ...s, name: row.name, unit: row.unit, price: row.price, code: row.code || s.code, cat: row.cat || s.cat }
+            : s);
+        } else {
+          next.push({ id: newKey(), code: row.code || undefined, name: row.name, unit: row.unit, price: row.price, icon: "🧼", cat: row.cat || "Garments" });
+        }
+      });
+      return next;
+    });
+    flash(`Price list imported — ${importPreview.updated} updated, ${importPreview.added} added${importPreview.skipped ? `, ${importPreview.skipped} skipped` : ""}.`);
+    setImportPreview(null);
+  };
+  const exportPriceList = () => {
+    if (typeof XLSX === "undefined") { flash("Excel support didn't load — check your internet connection and reload the app."); return; }
+    const data = services.map((s) => ({
+      "Service Code": String(s.code || s.id).toUpperCase(),
+      "Item": s.name,
+      "Unit": s.unit,
+      "Price (N$)": s.price,
+      "Category": s.cat || "",
+    }));
+    const ws = XLSX.utils.json_to_sheet(data);
+    ws["!cols"] = [{ wch: 12 }, { wch: 28 }, { wch: 10 }, { wch: 10 }, { wch: 12 }];
+    const wb = XLSX.utils.book_new();
+    XLSX.utils.book_append_sheet(wb, ws, "Price list");
+    XLSX.writeFile(wb, `hint-laundry-prices-${todayISO()}.xlsx`);
+    flash("Price list downloaded as Excel — edit it and import it back anytime.");
+  };
+
+  /* ---------- team (users) management ---------- */
+  const [userDraft, setUserDraft] = useState({ name: "", pin: "", role: "staff" });
+  const addUser = () => {
+    const name = userDraft.name.trim();
+    const pin = userDraft.pin.trim();
+    if (!name) { flash("Give the person a name."); return; }
+    if (!/^\d{4,6}$/.test(pin)) { flash("PIN must be 4–6 digits."); return; }
+    if (users.some((u) => u.pin === pin)) { flash("That PIN is already taken — pick a different one."); return; }
+    setUsers((us) => [...us, { id: newKey(), name, pin, role: userDraft.role }]);
+    setUserDraft({ name: "", pin: "", role: "staff" });
+    flash(`${name} added — they sign in with their own PIN.`);
+  };
+  const removeUser = (id) => {
+    const u = users.find((x) => x.id === id);
+    if (!u) return;
+    if (id === currentUserId) { flash("You can't remove yourself while signed in."); return; }
+    if (u.role === "admin" && users.filter((x) => x.role === "admin").length <= 1) {
+      flash("There must always be at least one owner."); return;
+    }
+    setUsers((us) => us.filter((x) => x.id !== id));
+    flash(`${u.name} removed.`);
+  };
+
+  /* ---------- new order ---------- */
+  const [sel, setSel] = useState({ customerId: "", name: "", phone: "", address: "", newMode: false });
+  const [custQuery, setCustQuery] = useState("");
+  const [custFocus, setCustFocus] = useState(false);
+  const custResults = useMemo(() => {
+    const q = custQuery.trim().toLowerCase();
+    if (!q) return [...customers].sort((a, b) => a.name.localeCompare(b.name));
+    const qDigits = q.replace(/\D/g, "").replace(/^0+/, "");
+    return customers.filter((c) => {
+      if (c.name.toLowerCase().includes(q)) return true;
+      if (qDigits.length < 3) return false;
+      const d = String(c.phone).replace(/\D/g, "");
+      const local = d.startsWith("264") ? d.slice(3) : d.replace(/^0+/, "");
+      return local.includes(qDigits) || d.includes(qDigits);
+    }).slice(0, 8);
+  }, [custQuery, customers]);
+  const selectedCustomer = customers.find((c) => c.id === sel.customerId) || null;
+  const pickCustomer = (c) => { setSel({ customerId: c.id, name: "", phone: "", address: "", newMode: false }); setCustQuery(""); };
+  const startNewCustomer = () => {
+    const q = custQuery.trim();
+    const isNumber = /^\+?[\d\s-]+$/.test(q);
+    setSel({ customerId: "", name: isNumber ? "" : q, phone: isNumber ? q : "", address: "", newMode: true });
+    setCustQuery("");
+  };
+  const [cart, setCart] = useState({});
+  const [customLines, setCustomLines] = useState([]); // {key, name, price, qty}
+  const [customDraft, setCustomDraft] = useState({ name: "", price: "" });
+  const [express, setExpress] = useState(false);
+  const [discount, setDiscount] = useState("");
+  const [collect, setCollect] = useState(() => computeCollection(new Date(), DEFAULT_SETTINGS.turnaroundDays));
+  const [notes, setNotes] = useState("");
+  const [payNow, setPayNow] = useState({ amount: "", method: DEFAULT_SETTINGS.payMethods[0] });
+
+  const clearTicket = () => {
+    setCart({}); setCustomLines([]); setExpress(false); setDiscount("");
+    setNotes(""); setPayNow({ amount: "", method: settings.payMethods[0] });
+    setCollect(computeCollection(new Date(), settings.turnaroundDays));
+    flash("Ticket cleared.");
+  };
+
+  /* Re-apply the collection rule whenever staff open a fresh New order screen */
+  useEffect(() => {
+    if (tab === "new" && Object.keys(cart).length === 0 && customLines.length === 0) {
+      setCollect(computeCollection(new Date(), settings.turnaroundDays));
+    }
+  }, [tab]); // eslint-disable-line
+
+  const setQty = (id, qty) => setCart((c) => {
+    const next = { ...c };
+    if (qty <= 0) delete next[id]; else next[id] = qty;
+    return next;
+  });
+  const addCustom = () => {
+    const price = parseFloat(customDraft.price);
+    if (!customDraft.name.trim() || !price || price <= 0) { flash("Give the custom item a name and a price."); return; }
+    setCustomLines((ls) => [...ls, { key: newKey(), name: customDraft.name.trim(), price, qty: 1 }]);
+    setCustomDraft({ name: "", price: "" });
+  };
+  const setCustomQty = (key, qty) => setCustomLines((ls) =>
+    qty <= 0 ? ls.filter((l) => l.key !== key) : ls.map((l) => l.key === key ? { ...l, qty } : l)
+  );
+
+  const cartLines = [
+    ...Object.entries(cart).map(([id, qty]) => {
+      const s = services.find((x) => x.id === id);
+      return { key: id, name: s.name, price: s.price, qty, line: s.price * qty };
+    }),
+    ...customLines.map((l) => ({ ...l, line: l.price * l.qty })),
+  ];
+  const subtotal = cartLines.reduce((a, l) => a + l.line, 0);
+  const expressFee = express ? Math.round(subtotal * (settings.expressRate / 100)) : 0;
+  const discountVal = Math.min(parseFloat(discount) || 0, subtotal + expressFee);
+  const total = Math.max(0, subtotal + expressFee - discountVal);
+
+  const createOrder = () => {
+    if (cartLines.length === 0) { flash("Add at least one item."); return; }
+    let cust = customers.find((c) => c.id === sel.customerId);
+    if (!cust) {
+      if (!sel.newMode) {
+        flash("Search for the customer above, or tap “Register new customer”.");
+        return;
+      }
+      if (!sel.name.trim() || !sel.phone.trim()) {
+        flash("Enter the new customer's name and phone.");
+        return;
+      }
+      if (!phoneLooksValid(sel.phone)) {
+        flash("Check the phone number — just the local number, e.g. 0813886676.");
+        return;
+      }
+      cust = {
+        id: "C-" + (1000 + customers.length + 1),
+        name: sel.name.trim(),
+        phone: displayPhone(sel.phone),
+        address: sel.address.trim() || "Oshikuku",
+        ts: Date.now(),
+      };
+      setCustomers((cs) => [...cs, cust]);
+    }
+    const id = "HL-" + orderSeq++;
+    const now = Date.now();
+    const payments = [];
+    const amt = parseFloat(payNow.amount);
+    if (amt > 0) payments.push({ amount: amt, method: payNow.method, ts: now, by: currentStaff });
+    const order = {
+      id, customerId: cust.id, customerName: cust.name, phone: cust.phone,
+      items: cartLines.map((l) => ({ key: l.key, name: l.name, qty: l.qty, price: l.price })),
+      express, discount: discountVal, collectDate: collect.date, collectSlot: collect.slot, notes: notes.trim(),
+      subtotal, expressFee, total,
+      status: "Received", takenBy: currentStaff,
+      statusHistory: [{ status: "Received", ts: now, by: currentStaff }],
+      payments, ts: now,
+    };
+    setOrders((os) => [order, ...os]);
+    setCart({}); setCustomLines([]); setExpress(false); setDiscount(""); setNotes("");
+    setSel({ customerId: "", name: "", phone: "", address: "", newMode: false });
+    setCustQuery("");
+    setCollect(computeCollection(new Date(), settings.turnaroundDays));
+    setPayNow({ amount: "", method: settings.payMethods[0] });
+    setPrinting({ type: "slip", orderId: id });
+    flash(`Order ${id} created by ${currentStaff}.`);
+  };
+
+  /* ---------- order actions ---------- */
+  const advanceStatus = (orderId) => {
+    setOrders((os) => os.map((o) => {
+      if (o.id !== orderId || o.cancelled) return o;
+      const idx = STATUSES.indexOf(o.status);
+      if (idx >= STATUSES.length - 1) return o;
+      const next = STATUSES[idx + 1];
+      return { ...o, status: next, statusHistory: [...o.statusHistory, { status: next, ts: Date.now(), by: currentStaff }] };
+    }));
+  };
+
+  const [payDraft, setPayDraft] = useState({});
+  const recordPayment = (orderId) => {
+    const draft = payDraft[orderId] || {};
+    const amount = parseFloat(draft.amount);
+    if (!amount || amount <= 0) { flash("Enter the amount received."); return; }
+    const method = draft.method || settings.payMethods[0];
+    setOrders((os) => os.map((o) => {
+      if (o.id !== orderId) return o;
+      return { ...o, payments: [...o.payments, { amount, method, ts: Date.now(), by: currentStaff }] };
+    }));
+    setPayDraft((d) => ({ ...d, [orderId]: { amount: "", method } }));
+    setPrinting({ type: "receipt", orderId });
+  };
+
+  const reversePayment = (orderId, index) => {
+    setOrders((os) => os.map((o) => {
+      if (o.id !== orderId) return o;
+      const p = o.payments[index];
+      if (!p || p.amount < 0 || p.reversed) return o;
+      const payments = o.payments.map((x, i) => i === index ? { ...x, reversed: true } : x);
+      payments.push({ amount: -p.amount, method: p.method, ts: Date.now(), by: currentStaff, reversalOf: index });
+      return { ...o, payments };
+    }));
+    flash("Payment reversed — the correction is on the record.");
+  };
+
+  const confirmCancel = () => {
+    if (!cancelDraft) return;
+    const reason = (cancelDraft.reason || "").trim();
+    if (!reason) { flash("Give a short reason for cancelling."); return; }
+    setOrders((os) => os.map((o) => o.id === cancelDraft.orderId
+      ? { ...o, cancelled: { reason, ts: Date.now(), by: currentStaff } }
+      : o));
+    setCancelDraft(null);
+    flash("Order cancelled. It stays on record but is excluded from sales.");
+  };
+
+  /* ---------- edit order ---------- */
+  const openEdit = (o) => {
+    setEdit({
+      orderId: o.id,
+      lines: o.items.map((it) => ({ key: it.key || newKey(), name: it.name, price: it.price, qty: it.qty })),
+      addId: "",
+      customDraft: { name: "", price: "" },
+      express: o.express,
+      discount: o.discount ? String(o.discount) : "",
+      collectDate: o.collectDate,
+      collectSlot: o.collectSlot,
+      notes: o.notes || "",
+    });
+  };
+  const editSetQty = (key, qty) => setEdit((e) => ({
+    ...e,
+    lines: qty <= 0 ? e.lines.filter((l) => l.key !== key) : e.lines.map((l) => l.key === key ? { ...l, qty } : l),
+  }));
+  const editAddService = () => {
+    setEdit((e) => {
+      if (!e.addId) return e;
+      const s = services.find((x) => x.id === e.addId);
+      return { ...e, addId: "", lines: [...e.lines, { key: newKey(), name: s.name, price: s.price, qty: 1 }] };
+    });
+  };
+  const editAddCustom = () => {
+    setEdit((e) => {
+      const price = parseFloat(e.customDraft.price);
+      if (!e.customDraft.name.trim() || !price || price <= 0) { flash("Give the custom item a name and a price."); return e; }
+      return { ...e, customDraft: { name: "", price: "" }, lines: [...e.lines, { key: newKey(), name: e.customDraft.name.trim(), price, qty: 1 }] };
+    });
+  };
+  const saveEdit = () => {
+    if (!edit) return;
+    if (edit.lines.length === 0) { flash("An order needs at least one item — or cancel it instead."); return; }
+    const sub = edit.lines.reduce((a, l) => a + l.price * l.qty, 0);
+    const exFee = edit.express ? Math.round(sub * (settings.expressRate / 100)) : 0;
+    const disc = Math.min(parseFloat(edit.discount) || 0, sub + exFee);
+    const tot = Math.max(0, sub + exFee - disc);
+    setOrders((os) => os.map((o) => o.id === edit.orderId ? {
+      ...o,
+      items: edit.lines.map((l) => ({ key: l.key, name: l.name, qty: l.qty, price: l.price })),
+      express: edit.express, discount: disc,
+      collectDate: edit.collectDate, collectSlot: edit.collectSlot, notes: edit.notes.trim(),
+      subtotal: sub, expressFee: exFee, total: tot,
+      editedTs: Date.now(), editedBy: currentStaff,
+    } : o));
+    setEdit(null);
+    flash("Order updated.");
+  };
+  const editSub = edit ? edit.lines.reduce((a, l) => a + l.price * l.qty, 0) : 0;
+  const editFee = edit && edit.express ? Math.round(editSub * (settings.expressRate / 100)) : 0;
+  const editDisc = edit ? Math.min(parseFloat(edit.discount) || 0, editSub + editFee) : 0;
+  const editTotal = edit ? Math.max(0, editSub + editFee - editDisc) : 0;
+
+  /* ---------- edit customer ---------- */
+  const [custEdit, setCustEdit] = useState(null); // { id, name, phone, address }
+  const [custTabQuery, setCustTabQuery] = useState("");
+  const filteredCustomers = useMemo(() => {
+    const q = custTabQuery.trim().toLowerCase();
+    if (!q) return customers;
+    const qDigits = q.replace(/\D/g, "").replace(/^0+/, "");
+    return customers.filter((c) => {
+      if (c.name.toLowerCase().includes(q)) return true;
+      if ((c.address || "").toLowerCase().includes(q)) return true;
+      if (qDigits.length < 3) return false;
+      const d = String(c.phone).replace(/\D/g, "");
+      const local = d.startsWith("264") ? d.slice(3) : d.replace(/^0+/, "");
+      return local.includes(qDigits) || d.includes(qDigits);
+    });
+  }, [custTabQuery, customers]);
+  const saveCustEdit = () => {
+    if (!custEdit) return;
+    if (!custEdit.name.trim() || !custEdit.phone.trim()) { flash("Name and phone can't be empty."); return; }
+    if (!phoneLooksValid(custEdit.phone)) { flash("Check the phone number — just the local number, e.g. 0813886676."); return; }
+    const phone = displayPhone(custEdit.phone);
+    setCustomers((cs) => cs.map((c) => c.id === custEdit.id
+      ? { ...c, name: custEdit.name.trim(), phone, address: custEdit.address.trim() }
+      : c));
+    setOrders((os) => os.map((o) => o.customerId === custEdit.id
+      ? { ...o, customerName: custEdit.name.trim(), phone }
+      : o));
+    setCustEdit(null);
+    flash("Customer updated — their orders were updated too.");
+  };
+
+  /* ---------- order list filters ---------- */
+  const [search, setSearch] = useState("");
+  const [filter, setFilter] = useState("open");
+  const visibleOrders = orders.filter((o) => {
+    if (filter === "open" && (o.status === DONE_STATUS || o.cancelled)) return false;
+    if (filter === "unpaid" && (payState(o) === "paid" || o.cancelled)) return false;
+    if (filter === "done" && (o.status !== DONE_STATUS || o.cancelled)) return false;
+    const q = search.trim().toLowerCase();
+    if (!q) return true;
+    return o.id.toLowerCase().includes(q) || o.customerName.toLowerCase().includes(q) || String(o.phone).includes(q);
+  });
+
+  /* ---------- reports (cancelled orders excluded) ---------- */
+  const [period, setPeriod] = useState("7");
+  const report = useMemo(() => {
+    let start = 0;
+    const now = Date.now();
+    if (period === "today") { const d = new Date(); d.setHours(0, 0, 0, 0); start = d.getTime(); }
+    else if (period === "7") start = now - 7 * 86400000;
+    else if (period === "30") start = now - 30 * 86400000;
+
+    const live = orders.filter((o) => !o.cancelled);
+    const pOrders = live.filter((o) => (o.ts || 0) >= start);
+    const collected = [];
+    orders.forEach((o) => o.payments.forEach((p) => { if ((p.ts || 0) >= start) collected.push(p); }));
+    const revenue = collected.reduce((a, p) => a + p.amount, 0);
+    const byMethod = {};
+    collected.forEach((p) => { byMethod[p.method] = (byMethod[p.method] || 0) + p.amount; });
+
+    const items = {};
+    pOrders.forEach((o) => o.items.forEach((it) => {
+      const k = it.name;
+      if (!items[k]) items[k] = { qty: 0, value: 0 };
+      items[k].qty += it.qty;
+      items[k].value += (it.price || 0) * it.qty;
+    }));
+    const topItems = Object.entries(items).sort((a, b) => b[1].value - a[1].value).slice(0, 8);
+
+    const outstanding = live.reduce((a, o) => a + balanceOf(o), 0);
+    const orderValue = pOrders.reduce((a, o) => a + o.total, 0);
+    const discounts = pOrders.reduce((a, o) => a + (o.discount || 0), 0);
+    return {
+      count: pOrders.length, revenue, orderValue,
+      avg: pOrders.length ? orderValue / pOrders.length : 0,
+      outstanding, discounts,
+      byMethod: Object.entries(byMethod).sort((a, b) => b[1] - a[1]),
+      topItems,
+      express: pOrders.filter((o) => o.express).length,
+      cancelled: orders.filter((o) => o.cancelled && (o.ts || 0) >= start).length,
+    };
+  }, [orders, period]);
+
+  const openCount = orders.filter((o) => o.status !== DONE_STATUS && !o.cancelled).length;
+
+  /* ---------- dashboard ---------- */
+  const dash = useMemo(() => {
+    const today = todayISO();
+    const d = new Date(); d.setHours(0, 0, 0, 0);
+    const st = d.getTime();
+    const live = orders.filter((o) => !o.cancelled);
+    const receivedToday = live.filter((o) => (o.ts || 0) >= st).length;
+    const ready = live.filter((o) => o.status === "Ready for collection");
+    const dueToday = live.filter((o) => o.status !== DONE_STATUS && o.collectDate === today);
+    const overdue = live.filter((o) => o.status !== DONE_STATUS && o.collectDate < today);
+    let cashToday = 0;
+    orders.forEach((o) => o.payments.forEach((p) => { if ((p.ts || 0) >= st) cashToday += p.amount; }));
+    const outstanding = live.reduce((a, o) => a + balanceOf(o), 0);
+    return { receivedToday, ready, dueToday, overdue, cashToday, outstanding };
+  }, [orders]);
+
+  const jumpToOrder = (id) => { setTab("orders"); setFilter("all"); setSearch(id); };
+
+  /* ---------- collections chart (last 14 days) ---------- */
+  const chartDays = useMemo(() => {
+    const days = [];
+    for (let i = 13; i >= 0; i--) {
+      const d = new Date(); d.setHours(0, 0, 0, 0); d.setDate(d.getDate() - i);
+      days.push({ key: d.toDateString(), lbl: d.toLocaleDateString("en-GB", { day: "2-digit" }), amt: 0 });
+    }
+    orders.forEach((o) => o.payments.forEach((p) => {
+      const k = new Date(p.ts).toDateString();
+      const day = days.find((x) => x.key === k);
+      if (day) day.amt += p.amount;
+    }));
+    return days;
+  }, [orders]);
+  const chartTotal = chartDays.reduce((a, d) => a + d.amt, 0);
+
+  /* ================================================================ */
+
+  if (!loaded) {
+    return (
+      <div className="app loading-screen">
+        <style>{CSS}</style>
+        <div className="loading-card"><span className="brand-drop">💧</span><div>Loading Hint Laundry…</div></div>
+      </div>
+    );
+  }
+
+  /* ---------- login ---------- */
+  if (!unlocked) {
+    const tryUnlock = () => {
+      const user = users.find((u) => u.pin === pinInput);
+      if (!user) { setPinError("PIN not recognised — try again."); setPinInput(""); return; }
+      setRole(user.role);
+      setCurrentStaff(user.name);
+      setCurrentUserId(user.id);
+      setUnlocked(true); setPinError(""); setPinInput("");
+      setTab("dash");
+      if (user.role === "admin" && Date.now() - lastBackupTs > 3 * 24 * 3600000) {
+        setTimeout(() => flash("Reminder: no recent backup — tap “Backup now” in Settings when you have a moment."), 600);
+      }
+    };
+    return (
+      <div className="app">
+        <style>{CSS}</style>
+        <div className="login-wrap">
+          <div className="login-card">
+            <span className="brand-drop big">💧</span>
+            <h1 className="login-title">{settings.shopName}</h1>
+            <p className="muted center-text">Enter your personal PIN to sign in</p>
+            <div className="pin-row">
+              <input value={pinInput} inputMode="numeric" maxLength={6} placeholder="••••" className="pin-field" autoFocus
+                onChange={(e) => { setPinInput(e.target.value.replace(/\D/g, "")); setPinError(""); }}
+                onKeyDown={(e) => e.key === "Enter" && tryUnlock()} />
+              <button className="btn-main" onClick={tryUnlock}>Sign in</button>
+            </div>
+            {pinError && <p className="pin-error">{pinError}</p>}
+            <p className="tiny">Demo PINs — Owner: 1234 · Staff: 5678. The owner adds real staff in the Team tab.</p>
+          </div>
+        </div>
+      </div>
+    );
+  }
+
+  const printOrder = printing ? orders.find((o) => o.id === printing.orderId) : null;
+
+  return (
+    <div className="app">
+      <style>{CSS}</style>
+
+      {/* ---------- print overlay ---------- */}
+      {printOrder && (
+        <div className="print-overlay">
+          <div className={"print-doc" + (settings.printFormat === "thermal" ? " thermal" : "")}>
+            {printing.type === "slip" ? <Slip o={printOrder} st={settings} /> : <Receipt o={printOrder} st={settings} />}
+          </div>
+          <div className="print-actions no-print">
+            <button className="btn-main" onClick={() => window.print()}>🖨️ Print</button>
+            <a className="btn-wa" target="_blank" rel="noreferrer"
+               href={waTo(printOrder.phone, printing.type === "slip" ? slipText(printOrder, settings) : receiptText(printOrder, settings))}>
+              📲 Send on WhatsApp
+            </a>
+            <button className="btn-ghost" onClick={() => setPrinting(null)}>Close</button>
+          </div>
+        </div>
+      )}
+
+      {/* ---------- edit order overlay ---------- */}
+      {edit && (
+        <div className="print-overlay no-print">
+          <div className="edit-panel">
+            <h2>Edit {edit.orderId}</h2>
+            <p className="muted">Fix quantities, add or remove items, adjust the discount or collection time.</p>
+
+            {edit.lines.map((l) => (
+              <div key={l.key} className="svc-row">
+                <div className="svc-info">
+                  <div>{l.name}</div>
+                  <span>{fmt(l.price)} each</span>
+                </div>
+                <div className="qty">
+                  <button onClick={() => editSetQty(l.key, l.qty - 1)} aria-label={`Remove one ${l.name}`}>−</button>
+                  <span>{l.qty}</span>
+                  <button onClick={() => editSetQty(l.key, l.qty + 1)} aria-label={`Add one ${l.name}`}>+</button>
+                </div>
+              </div>
+            ))}
+
+            <div className="edit-adders">
+              <div className="edit-add">
+                <select value={edit.addId} onChange={(e) => setEdit({ ...edit, addId: e.target.value })}>
+                  <option value="">Add from price list…</option>
+                  {services.map((s) => <option key={s.id} value={s.id}>{s.name} — {fmt(s.price)}</option>)}
+                </select>
+                <button className="btn-ghost small" onClick={editAddService}>Add</button>
+              </div>
+              <div className="edit-add">
+                <input value={edit.customDraft.name} placeholder="Custom item name"
+                  onChange={(e) => setEdit({ ...edit, customDraft: { ...edit.customDraft, name: e.target.value } })} />
+                <input type="number" min="0" value={edit.customDraft.price} placeholder="Price" className="narrow"
+                  onChange={(e) => setEdit({ ...edit, customDraft: { ...edit.customDraft, price: e.target.value } })} />
+                <button className="btn-ghost small" onClick={editAddCustom}>Add</button>
+              </div>
+            </div>
+
+            <div className="form two-col edit-fields">
+              <label>Collection date
+                <input type="date" value={edit.collectDate} onChange={(e) => setEdit({ ...edit, collectDate: e.target.value })} />
+              </label>
+              <label>Collection time
+                <select value={edit.collectSlot} onChange={(e) => setEdit({ ...edit, collectSlot: e.target.value })}>
+                  {!settings.slots.includes(edit.collectSlot) && <option value={edit.collectSlot}>{edit.collectSlot}</option>}
+                  {settings.slots.map((s) => <option key={s}>{s}</option>)}
+                </select>
+              </label>
+              <label>Discount (N$)
+                <input type="number" min="0" value={edit.discount} placeholder="0"
+                  onChange={(e) => setEdit({ ...edit, discount: e.target.value })} />
+              </label>
+              <label className="express-inline">
+                <input type="checkbox" checked={edit.express} onChange={(e) => setEdit({ ...edit, express: e.target.checked })} />
+                Express (+{settings.expressRate}%)
+              </label>
+              <label className="span2">Notes
+                <input value={edit.notes} onChange={(e) => setEdit({ ...edit, notes: e.target.value })} />
+              </label>
+            </div>
+
+            <div className="edit-total">
+              Subtotal {fmt(editSub)}{editFee > 0 ? ` · Express ${fmt(editFee)}` : ""}{editDisc > 0 ? ` · Discount −${fmt(editDisc)}` : ""} · <b>New total {fmt(editTotal)}</b>
+            </div>
+
+            <div className="edit-actions">
+              <button className="btn-main" onClick={saveEdit}>Save changes</button>
+              <button className="btn-ghost" onClick={() => setEdit(null)}>Discard</button>
+            </div>
+          </div>
+        </div>
+      )}
+
+      <div className={"shell layout" + (printOrder || edit ? " shell-dim" : "")}>
+        {/* ---------- sidebar ---------- */}
+        <aside className="sidebar no-print">
+          <div className="sb-brand">
+            <span className="sb-logo">💧</span>
+            <div>
+              <b>{settings.shopName.split("&")[0].trim()}</b>
+              <span>Laundry Management</span>
+            </div>
+          </div>
+          <nav className="sb-nav">
+            <button className={tab === "dash" ? "on" : ""} onClick={() => setTab("dash")}><i>🏠</i> Dashboard</button>
+            <button className={tab === "new" ? "on" : ""} onClick={() => setTab("new")}><i>➕</i> New order</button>
+            <button className={tab === "orders" ? "on" : ""} onClick={() => setTab("orders")}><i>🧺</i> Orders{openCount ? <em className="sb-badge">{openCount}</em> : null}</button>
+            <button className={tab === "customers" ? "on" : ""} onClick={() => setTab("customers")}><i>👥</i> Customers</button>
+            {isAdmin && <button className={tab === "reports" ? "on" : ""} onClick={() => setTab("reports")}><i>📊</i> Reports</button>}
+            {isAdmin && <button className={tab === "prices" ? "on" : ""} onClick={() => setTab("prices")}><i>🏷️</i> Price list</button>}
+            {isAdmin && <button className={tab === "team" ? "on" : ""} onClick={() => setTab("team")}><i>👤</i> Team</button>}
+            {isAdmin && <button className={tab === "settings" ? "on" : ""} onClick={() => setTab("settings")}><i>⚙️</i> Settings</button>}
+          </nav>
+          <div className="sb-foot">
+            <div className="sb-user">
+              <span className="sb-avatar">{currentStaff.slice(0, 1).toUpperCase()}</span>
+              <div><b>{currentStaff}</b><span>{isAdmin ? "Owner" : "Staff"}</span></div>
+            </div>
+            <button className="btn-lock" onClick={() => { setUnlocked(false); setCurrentStaff(""); }} aria-label="Lock the app">🔒 Lock</button>
+          </div>
+        </aside>
+
+        <div className="main-col">
+          {toast && <div className="toast">{toast}</div>}
+
+          <main className="wrap">
+            <div className="page-head no-print">
+              <h1>{PAGE_META[tab] ? PAGE_META[tab][0] : ""}</h1>
+              <p>{PAGE_META[tab] ? PAGE_META[tab][1] : ""}</p>
+            </div>
+
+          {/* ================= DASHBOARD ================= */}
+          {tab === "dash" && (
+            <section>
+              <div className="report-head no-print">
+                <div className="chip-row" />
+                <button className="btn-main" onClick={() => setTab("new")}>＋ New order</button>
+              </div>
+
+              <div className="stat-row">
+                <div className="stat"><span className="stat-lbl">Collected today</span><b className="c-blue">{fmt(dash.cashToday)}</b><span>payments received</span></div>
+                <div className="stat"><span className="stat-lbl">Orders today</span><b>{dash.receivedToday}</b><span>received at the counter</span></div>
+                <div className="stat"><span className="stat-lbl">Ready</span><b className="c-green">{dash.ready.length}</b><span>waiting for collection</span></div>
+                <div className="stat"><span className="stat-lbl">Due today</span><b>{dash.dueToday.length}</b><span>collections booked</span></div>
+                <div className="stat"><span className="stat-lbl">Outstanding</span><b className="c-red">{fmt(dash.outstanding)}</b><span>balances owed</span></div>
+              </div>
+
+              <div className="panel">
+                <div className="panel-head">
+                  <h2>Collections — last 14 days</h2>
+                  <span className="panel-total">{fmt(chartTotal)}</span>
+                </div>
+                <BarChart data={chartDays} />
+              </div>
+
+              <div className="report-grid">
+                <div className="panel">
+                  <h2>Overdue collections</h2>
+                  <p className="muted">Past their collection date and still with us — worth a WhatsApp reminder.</p>
+                  {dash.overdue.length === 0 && <p className="muted">Nothing overdue. 🎉</p>}
+                  {dash.overdue.map((o) => (
+                    <div key={o.id} className="dash-row">
+                      <div>
+                        <b>{o.id}</b> · {o.customerName}
+                        <span className="dash-sub">was due {o.collectDate} · balance {fmt(balanceOf(o))}</span>
+                      </div>
+                      <div className="dash-acts">
+                        <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, overdueText(o, settings))}>Send reminder</a>
+                        <button className="btn-ghost small" onClick={() => jumpToOrder(o.id)}>Open</button>
+                      </div>
+                    </div>
+                  ))}
+                </div>
+
+                <div className="panel">
+                  <h2>Ready — collect &amp; pay</h2>
+                  <p className="muted">Cleaned and waiting; balance is collected on pickup.</p>
+                  {dash.ready.length === 0 && <p className="muted">Nothing waiting for collection right now.</p>}
+                  {dash.ready.map((o) => {
+                    const bal = balanceOf(o);
+                    return (
+                      <div key={o.id} className="dash-row">
+                        <div>
+                          <b>{o.id}</b> · {o.customerName}
+                          <span className="dash-sub">{bal > 0 ? `balance ${fmt(bal)}` : "fully paid"} · collection {o.collectDate}</span>
+                        </div>
+                        <div className="dash-acts">
+                          <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, readyText(o, settings))}>Notify ready</a>
+                          <button className="btn-ghost small" onClick={() => jumpToOrder(o.id)}>Open</button>
+                        </div>
+                      </div>
+                    );
+                  })}
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* ================= NEW ORDER ================= */}
+          {tab === "new" && (
+            <section className="order-grid">
+              <div className="panel">
+                <h2>New order</h2>
+                <p className="muted">Register the customer (first visit only), count the items, take a deposit.</p>
+
+                <div className="svc-cat">Customer</div>
+                {selectedCustomer ? (
+                  <div className="cust-selected">
+                    <div>
+                      <b>{selectedCustomer.name}</b>
+                      <span className="dash-sub">{selectedCustomer.phone} · {selectedCustomer.address}</span>
+                    </div>
+                    <button className="btn-ghost small" onClick={() => setSel({ customerId: "", name: "", phone: "", address: "", newMode: false })}>Change</button>
+                  </div>
+                ) : sel.newMode ? (
+                  <div className="form">
+                    <div className="new-cust-head">
+                      <span>Registering a new customer</span>
+                      <button className="btn-ghost small" onClick={() => setSel({ customerId: "", name: "", phone: "", address: "", newMode: false })}>Back to search</button>
+                    </div>
+                    <label>Full name
+                      <input value={sel.name} onChange={(e) => setSel({ ...sel, name: e.target.value })} placeholder="Customer's name" autoFocus />
+                    </label>
+                    <label>Phone (WhatsApp)
+                      <div className="phone-wrap">
+                        <span className="phone-cc">+264</span>
+                        <input value={sel.phone} inputMode="tel" onChange={(e) => setSel({ ...sel, phone: e.target.value })} placeholder="0813886676" />
+                      </div>
+                    </label>
+                    <label>Address (optional)
+                      <input value={sel.address} onChange={(e) => setSel({ ...sel, address: e.target.value })} placeholder="Erf / street, Oshikuku" />
+                    </label>
+                  </div>
+                ) : (
+                  <div className="cust-search">
+                    <div className="cust-combo">
+                      <input value={custQuery} placeholder="Select or search customer…"
+                        onFocus={() => setCustFocus(true)}
+                        onBlur={() => setTimeout(() => setCustFocus(false), 150)}
+                        onChange={(e) => { setCustQuery(e.target.value); setCustFocus(true); }} />
+                      <span className="combo-arrow" aria-hidden="true">▾</span>
+                    </div>
+                    {(custFocus || custQuery.trim()) && (
+                      <div className="cust-results" onMouseDown={(e) => e.preventDefault()}>
+                        {custResults.map((c) => (
+                          <button key={c.id} className="cust-result" onClick={() => { pickCustomer(c); setCustFocus(false); }}>
+                            <b>{c.name}</b><span>{c.phone}</span>
+                          </button>
+                        ))}
+                        {custResults.length === 0 && <div className="cust-none">No match found.</div>}
+                      </div>
+                    )}
+                    <button className="btn-ghost new-cust-btn" onClick={startNewCustomer}>＋ Register new customer</button>
+                  </div>
+                )}
+
+                <div className="svc-cat">Items</div>
+                {["Garments", "Household"].map((cat) => (
+                  <div key={cat} className="svc-group">
+                    {services.filter((s) => s.cat === cat).map((s) => (
+                      <div key={s.id} className="svc-row">
+                        <span className="svc-icon">{s.icon}</span>
+                        <div className="svc-info">
+                          <div>{s.name}</div>
+                          <span>{fmt(s.price)} {s.unit}</span>
+                        </div>
+                        <div className="qty">
+                          <button onClick={() => setQty(s.id, (cart[s.id] || 0) - 1)} aria-label={`Remove one ${s.name}`}>−</button>
+                          <span>{cart[s.id] || 0}</span>
+                          <button onClick={() => setQty(s.id, (cart[s.id] || 0) + 1)} aria-label={`Add one ${s.name}`}>+</button>
+                        </div>
+                      </div>
+                    ))}
+                  </div>
+                ))}
+
+                <div className="svc-cat">Custom item (anything not on the list)</div>
+                {customLines.map((l) => (
+                  <div key={l.key} className="svc-row">
+                    <span className="svc-icon">✨</span>
+                    <div className="svc-info">
+                      <div>{l.name}</div>
+                      <span>{fmt(l.price)} each</span>
+                    </div>
+                    <div className="qty">
+                      <button onClick={() => setCustomQty(l.key, l.qty - 1)} aria-label={`Remove one ${l.name}`}>−</button>
+                      <span>{l.qty}</span>
+                      <button onClick={() => setCustomQty(l.key, l.qty + 1)} aria-label={`Add one ${l.name}`}>+</button>
+                    </div>
+                  </div>
+                ))}
+                <div className="edit-add">
+                  <input value={customDraft.name} placeholder="e.g. Wedding gown"
+                    onChange={(e) => setCustomDraft({ ...customDraft, name: e.target.value })} />
+                  <input type="number" min="0" value={customDraft.price} placeholder="Price" className="narrow"
+                    onChange={(e) => setCustomDraft({ ...customDraft, price: e.target.value })} />
+                  <button className="btn-ghost small" onClick={addCustom}>Add</button>
+                </div>
+
+                <label className="express">
+                  <input type="checkbox" checked={express} onChange={(e) => setExpress(e.target.checked)} />
+                  <div>
+                    <div>Express service (+{settings.expressRate}%)</div>
+                    <span>Back within 24 hours</span>
+                  </div>
+                </label>
+
+                <h2 className="mt">Collection &amp; payment</h2>
+                <p className="muted small-note">Collection is set automatically: morning orders (07:30–12:00) → next day 13:00–14:00 · Saturday orders → Monday 14:00–15:00 · otherwise one full day later, same time. Adjust below if the customer prefers.</p>
+                <div className="form two-col">
+                  <label>Collection date
+                    <input type="date" min={todayISO()} value={collect.date}
+                      onChange={(e) => setCollect({ ...collect, date: e.target.value })} />
+                  </label>
+                  <label>Collection time
+                    <select value={collect.slot} onChange={(e) => setCollect({ ...collect, slot: e.target.value })}>
+                      {!settings.slots.includes(collect.slot) && <option value={collect.slot}>{collect.slot} (auto)</option>}
+                      {settings.slots.map((s) => <option key={s}>{s}</option>)}
+                    </select>
+                  </label>
+                  <label>Payment now (optional)
+                    <input type="number" min="0" value={payNow.amount} placeholder="Amount received"
+                      onChange={(e) => setPayNow({ ...payNow, amount: e.target.value })} />
+                  </label>
+                  <label>Payment method
+                    <select value={payNow.method} onChange={(e) => setPayNow({ ...payNow, method: e.target.value })}>
+                      {settings.payMethods.map((m) => <option key={m}>{m}</option>)}
+                    </select>
+                  </label>
+                  <label>Discount (N$, optional)
+                    <input type="number" min="0" value={discount} placeholder="0"
+                      onChange={(e) => setDiscount(e.target.value)} />
+                  </label>
+                  <label>Notes
+                    <input value={notes} placeholder="Stains to watch, fabric care…" onChange={(e) => setNotes(e.target.value)} />
+                  </label>
+                </div>
+              </div>
+
+              <aside className="ticket">
+                <div className="ticket-hole" />
+                <div className="ticket-head">ORDER TICKET</div>
+                {cartLines.length === 0 ? (
+                  <div className="ticket-empty">No items yet.<br />Count the customer's items in.</div>
+                ) : (
+                  <div className="ticket-lines">
+                    {cartLines.map((l) => (
+                      <div key={l.key}><span>{l.qty} × {l.name}</span><b>{fmt(l.line)}</b></div>
+                    ))}
+                    <div className="rule" />
+                    <div><span>Subtotal</span><b>{fmt(subtotal)}</b></div>
+                    {express && <div><span>Express +{settings.expressRate}%</span><b>{fmt(expressFee)}</b></div>}
+                    {discountVal > 0 && <div><span>Discount</span><b>−{fmt(discountVal)}</b></div>}
+                    <div className="rule" />
+                    <div className="ticket-total"><span>Total</span><b>{fmt(total)}</b></div>
+                  </div>
+                )}
+                <button className="btn-main w-full" onClick={createOrder}>Create order &amp; print slip</button>
+                {(cartLines.length > 0 || express || discount || notes || payNow.amount) && (
+                  <button className="btn-clear" onClick={clearTicket}>✕ Clear order ticket</button>
+                )}
+                <div className="ticket-serration" />
+              </aside>
+            </section>
+          )}
+
+          {/* ================= ORDERS ================= */}
+          {tab === "orders" && (
+            <section>
+              <div className="order-toolbar no-print">
+                <input className="search" value={search} placeholder="Search name, phone or order no…"
+                  onChange={(e) => setSearch(e.target.value)} />
+                <div className="chip-row">
+                  {[["open", "Open"], ["unpaid", "Unpaid"], ["done", "Completed"], ["all", "All"]].map(([k, l]) => (
+                    <button key={k} className={"chip-btn" + (filter === k ? " on" : "")} onClick={() => setFilter(k)}>{l}</button>
+                  ))}
+                </div>
+              </div>
+
+              {visibleOrders.length === 0 && <div className="panel"><p className="muted">No orders match.</p></div>}
+              {visibleOrders.map((o) => {
+                const ps = payState(o);
+                const draft = payDraft[o.id] || { amount: "", method: settings.payMethods[0] };
+                const idx = STATUSES.indexOf(o.status);
+                const isCancelling = cancelDraft && cancelDraft.orderId === o.id;
+                return (
+                  <div key={o.id} className={"panel admin-order" + (o.cancelled ? " order-cancelled" : "")}>
+                    <div className="ao-head">
+                      <div>
+                        <b>{o.id}</b> · {o.customerName} <span className="muted">({o.phone})</span>
+                        {o.express && <span className="chip express-chip">EXPRESS</span>}
+                        {o.cancelled && <span className="chip cancel-chip">CANCELLED</span>}
+                        {o.editedTs && !o.cancelled && <span className="chip edited-chip">edited</span>}
+                      </div>
+                      {!o.cancelled && (
+                        <span className={`chip pay-${ps}`}>{ps === "paid" ? "Paid" : ps === "partial" ? `Partial · ${fmt(paidOf(o))}/${fmt(o.total)}` : "Unpaid"}</span>
+                      )}
+                    </div>
+                    <div className="ao-meta">
+                      <span>Received {label(o.ts)}{o.takenBy ? ` by ${o.takenBy}` : ""}</span>
+                      <span>Collection {o.collectDate} · {o.collectSlot}</span>
+                      {o.discount > 0 && <span>Discount {fmt(o.discount)}</span>}
+                      {o.notes && <span>“{o.notes}”</span>}
+                      {o.cancelled && <span className="cancel-note">Cancelled by {o.cancelled.by}: “{o.cancelled.reason}”</span>}
+                    </div>
+                    <div className="ao-items">
+                      {o.items.map((it, i) => <span key={i}>{it.qty} × {it.name}</span>)}
+                      <b>{fmt(o.total)}</b>
+                    </div>
+
+                    {!o.cancelled && <Cycle status={o.status} />}
+
+                    {!o.cancelled && !isCancelling && (
+                      <div className="ao-actions">
+                        {idx < STATUSES.length - 1 ? (
+                          <button className="btn-main small" onClick={() => advanceStatus(o.id)}>Mark “{STATUSES[idx + 1]}”</button>
+                        ) : <span className="chip pay-paid">Completed</span>}
+                        <button className="btn-ghost small" onClick={() => setPrinting({ type: "slip", orderId: o.id })}>🧾 Slip</button>
+                        {o.payments.length > 0 && (
+                          <button className="btn-ghost small" onClick={() => setPrinting({ type: "receipt", orderId: o.id })}>🧾 Receipt</button>
+                        )}
+                        {o.status === "Ready for collection" && (
+                          <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, readyText(o, settings))}>📣 Notify ready</a>
+                        )}
+                        {o.status !== DONE_STATUS && (
+                          <>
+                            <button className="btn-ghost small" onClick={() => openEdit(o)}>✏️ Edit</button>
+                            {isAdmin && <button className="btn-ghost small danger" onClick={() => setCancelDraft({ orderId: o.id, reason: "" })}>Cancel order</button>}
+                          </>
+                        )}
+                      </div>
+                    )}
+
+                    {isCancelling && (
+                      <div className="cancel-form">
+                        <input value={cancelDraft.reason} placeholder="Reason for cancelling (required)"
+                          onChange={(e) => setCancelDraft({ ...cancelDraft, reason: e.target.value })} />
+                        <button className="btn-main small danger-bg" onClick={confirmCancel}>Confirm cancel</button>
+                        <button className="btn-ghost small" onClick={() => setCancelDraft(null)}>Keep order</button>
+                      </div>
+                    )}
+
+                    {!o.cancelled && ps !== "paid" && !isCancelling && (
+                      <div className="pay-form">
+                        <input type="number" min="0" placeholder={`Amount (due ${fmt(balanceOf(o))})`}
+                          value={draft.amount}
+                          onChange={(e) => setPayDraft((d) => ({ ...d, [o.id]: { ...draft, amount: e.target.value } }))} />
+                        <select value={draft.method}
+                          onChange={(e) => setPayDraft((d) => ({ ...d, [o.id]: { ...draft, method: e.target.value } }))}>
+                          {settings.payMethods.map((m) => <option key={m}>{m}</option>)}
+                        </select>
+                        <button className="btn-ghost small" onClick={() => recordPayment(o.id)}>Record payment &amp; receipt</button>
+                      </div>
+                    )}
+
+                    {o.payments.length > 0 && (
+                      <div className="pay-log">
+                        {o.payments.map((p, i) => (
+                          <span key={i} className={p.amount < 0 ? "pay-reversal" : p.reversed ? "pay-reversed" : ""}>
+                            {fmt(p.amount)} · {p.method} · {label(p.ts)}{p.by ? ` · ${p.by}` : ""}
+                            {p.amount > 0 && !p.reversed && !o.cancelled && isAdmin && (
+                              <button className="reverse-btn" title="Reverse this payment (correction)"
+                                onClick={() => reversePayment(o.id, i)}>↩</button>
+                            )}
+                          </span>
+                        ))}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
+            </section>
+          )}
+
+          {/* ================= CUSTOMERS ================= */}
+          {tab === "customers" && (
+            <section className="panel">
+              <h2>Customers</h2>
+              <p className="muted">New customers are registered on the “+ New order” screen during their first visit. Use Edit to fix a wrong name or phone number.</p>
+              <div className="order-toolbar no-print">
+                <input className="search" value={custTabQuery} placeholder="Search name, phone or address…"
+                  onChange={(e) => setCustTabQuery(e.target.value)} />
+                {custTabQuery && <button className="btn-ghost small" onClick={() => setCustTabQuery("")}>Clear</button>}
+                <span className="ft-note">{filteredCustomers.length} of {customers.length}</span>
+              </div>
+              <table className="table">
+                <thead><tr><th>ID</th><th>Name</th><th>Phone</th><th>Address</th><th>Orders</th><th>Spent</th><th></th></tr></thead>
+                <tbody>
+                  {filteredCustomers.length === 0 && (
+                    <tr><td colSpan="7" className="cust-none">No customer matches “{custTabQuery}”.</td></tr>
+                  )}
+                  {filteredCustomers.map((c) => {
+                    const cOrders = orders.filter((o) => o.customerId === c.id && !o.cancelled);
+                    const spent = cOrders.reduce((a, o) => a + paidOf(o), 0);
+                    const editing = custEdit && custEdit.id === c.id;
+                    return editing ? (
+                      <tr key={c.id} className="cust-edit-row">
+                        <td>{c.id}</td>
+                        <td><input value={custEdit.name} onChange={(e) => setCustEdit({ ...custEdit, name: e.target.value })} /></td>
+                        <td><input value={custEdit.phone} onChange={(e) => setCustEdit({ ...custEdit, phone: e.target.value })} /></td>
+                        <td><input value={custEdit.address} onChange={(e) => setCustEdit({ ...custEdit, address: e.target.value })} /></td>
+                        <td colSpan="3">
+                          <div className="dash-acts">
+                            <button className="btn-main small" onClick={saveCustEdit}>Save</button>
+                            <button className="btn-ghost small" onClick={() => setCustEdit(null)}>Discard</button>
+                          </div>
+                        </td>
+                      </tr>
+                    ) : (
+                      <tr key={c.id}>
+                        <td>{c.id}</td><td>{c.name}</td><td>{c.phone}</td><td>{c.address}</td>
+                        <td>{cOrders.length}</td><td>{fmt(spent)}</td>
+                        <td><button className="btn-ghost small" onClick={() => setCustEdit({ id: c.id, name: c.name, phone: c.phone, address: c.address })}>✏️ Edit</button></td>
+                      </tr>
+                    );
+                  })}
+                </tbody>
+              </table>
+            </section>
+          )}
+
+          {/* ================= REPORTS (owner only) ================= */}
+          {tab === "reports" && isAdmin && (
+            <section>
+              <div className="report-head no-print">
+                <div className="chip-row">
+                  {[["today", "Today"], ["7", "Last 7 days"], ["30", "Last 30 days"], ["all", "All time"]].map(([k, l]) => (
+                    <button key={k} className={"chip-btn" + (period === k ? " on" : "")} onClick={() => setPeriod(k)}>{l}</button>
+                  ))}
+                </div>
+              </div>
+
+              <div className="stat-row">
+                <div className="stat"><span className="stat-lbl">Money collected</span><b className="c-blue">{fmt(report.revenue)}</b><span>in this period</span></div>
+                <div className="stat"><span className="stat-lbl">Orders taken</span><b>{report.count}</b><span>excluding cancelled</span></div>
+                <div className="stat"><span className="stat-lbl">Average order</span><b>{fmt(report.avg)}</b><span>per order value</span></div>
+                <div className="stat"><span className="stat-lbl">Discounts</span><b className="c-amber">{fmt(report.discounts)}</b><span>given in this period</span></div>
+                <div className="stat"><span className="stat-lbl">Outstanding</span><b className="c-red">{fmt(report.outstanding)}</b><span>all-time balances</span></div>
+              </div>
+
+              <div className="report-grid">
+                <div className="panel">
+                  <h2>Payments by method</h2>
+                  {report.byMethod.length === 0 && <p className="muted">No payments in this period.</p>}
+                  <table className="table">
+                    <tbody>
+                      {report.byMethod.map(([m, v]) => (
+                        <tr key={m}>
+                          <td>{m}</td>
+                          <td className="num">{fmt(v)}</td>
+                          <td className="bar-cell">
+                            <div className="bar" style={{ width: Math.max(4, Math.round((v / (report.revenue || 1)) * 100)) + "%" }} />
+                          </td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {report.cancelled > 0 && <p className="tiny left">{report.cancelled} cancelled order{report.cancelled > 1 ? "s" : ""} in this period (excluded from sales).</p>}
+                </div>
+
+                <div className="panel">
+                  <h2>Top items</h2>
+                  {report.topItems.length === 0 && <p className="muted">No orders in this period.</p>}
+                  <table className="table">
+                    <thead><tr><th>Item</th><th className="num">Qty</th><th className="num">Value</th></tr></thead>
+                    <tbody>
+                      {report.topItems.map(([name, d]) => (
+                        <tr key={name}><td>{name}</td><td className="num">{d.qty}</td><td className="num">{fmt(d.value)}</td></tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  {report.express > 0 && <p className="tiny left">{report.express} express order{report.express > 1 ? "s" : ""} in this period.</p>}
+                </div>
+              </div>
+            </section>
+          )}
+
+          {/* ================= PRICE LIST (owner only) ================= */}
+          {tab === "prices" && isAdmin && (
+            <section className="panel">
+              <h2>Price list</h2>
+              <p className="muted">Type the new amount — it saves automatically and applies to new orders. Existing slips keep the price the customer was charged.</p>
+              <div className="edit-add" style={{ marginBottom: 14 }}>
+                <button className="btn-main small" onClick={() => priceFileInput.current && priceFileInput.current.click()}>⬆ Import price list (Excel)</button>
+                <button className="btn-ghost small" onClick={exportPriceList}>⬇ Download as Excel</button>
+                <input type="file" ref={priceFileInput} accept=".xlsx,.xls,.csv" style={{ display: "none" }}
+                  onChange={(e) => { const f = e.target.files && e.target.files[0]; if (f) parsePriceFile(f); e.target.value = ""; }} />
+              </div>
+              <p className="muted" style={{ marginTop: -6 }}>Excel columns: <strong>Service Code · Item · Unit · Price (N$)</strong> (Category optional). Items are matched by code or name — matches update the price, new ones are added. Tip: download the current list first and use it as your template.</p>
+              {importPreview && (
+                <div style={{ background: "#F0F6FF", border: "1px solid #BFDBFE", borderRadius: 10, padding: 14, marginBottom: 16 }}>
+                  <strong>Import preview — {importPreview.fileName}</strong>
+                  <p className="muted" style={{ margin: "6px 0 10px" }}>
+                    {importPreview.updated} item(s) will be updated, {importPreview.added} new item(s) added
+                    {importPreview.skipped ? `, ${importPreview.skipped} row(s) skipped (missing name or price)` : ""}. Nothing changes until you press Apply.
+                  </p>
+                  <table className="table">
+                    <thead><tr><th>Code</th><th>Item</th><th>Unit</th><th>Price (N$)</th><th>Action</th></tr></thead>
+                    <tbody>
+                      {importPreview.rows.map((r, i) => (
+                        <tr key={i}>
+                          <td>{r.code || "—"}</td>
+                          <td>{r.name}</td>
+                          <td>{r.unit}</td>
+                          <td>{r.price}</td>
+                          <td><span className={"chip " + (r.action === "add" ? "role-admin" : "role-staff")}>{r.action === "add" ? "New" : "Update"}</span></td>
+                        </tr>
+                      ))}
+                    </tbody>
+                  </table>
+                  <div style={{ display: "flex", gap: 10, marginTop: 12 }}>
+                    <button className="btn-main small" onClick={applyImport}>Apply import</button>
+                    <button className="btn-ghost small" onClick={() => setImportPreview(null)}>Cancel</button>
+                  </div>
+                </div>
+              )}
+              <table className="table">
+                <thead><tr><th>Item</th><th>Unit</th><th>Price (N$)</th><th></th></tr></thead>
+                <tbody>
+                  {services.map((s) => (
+                    <tr key={s.id}>
+                      <td>{s.icon} {s.name}</td>
+                      <td>{s.unit}</td>
+                      <td>
+                        <input type="number" min="0" step="1" className="price-input" value={s.price}
+                          aria-label={`Price for ${s.name}`}
+                          onChange={(e) => {
+                            const v = parseFloat(e.target.value);
+                            setServices((sv) => sv.map((x) => x.id === s.id ? { ...x, price: isNaN(v) ? 0 : v } : x));
+                          }} />
+                      </td>
+                      <td><button className="btn-ghost small danger" onClick={() => removeService(s.id)}>Remove</button></td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="svc-cat">Add an item</div>
+              <div className="edit-add">
+                <input value={svcDraft.name} placeholder="Item name, e.g. School uniform"
+                  onChange={(e) => setSvcDraft({ ...svcDraft, name: e.target.value })} />
+                <input type="number" min="0" value={svcDraft.price} placeholder="Price" className="narrow"
+                  onChange={(e) => setSvcDraft({ ...svcDraft, price: e.target.value })} />
+                <select value={svcDraft.unit} className="narrow"
+                  onChange={(e) => setSvcDraft({ ...svcDraft, unit: e.target.value })}>
+                  <option>per item</option><option>per pair</option><option>per kg</option>
+                </select>
+                <select value={svcDraft.cat} className="narrow"
+                  onChange={(e) => setSvcDraft({ ...svcDraft, cat: e.target.value })}>
+                  <option>Garments</option><option>Household</option>
+                </select>
+                <button className="btn-main small" onClick={addService}>Add</button>
+              </div>
+            </section>
+          )}
+          {/* ================= TEAM (owner only) ================= */}
+          {tab === "team" && isAdmin && (
+            <section className="panel">
+              <h2>Team &amp; PINs</h2>
+              <p className="muted">Each person signs in with their own PIN, and everything they do is recorded under their name. Staff PINs give daily-operations access; Owner PINs unlock everything.</p>
+              <table className="table">
+                <thead><tr><th>Name</th><th>Role</th><th>PIN</th><th></th></tr></thead>
+                <tbody>
+                  {users.map((u) => (
+                    <tr key={u.id}>
+                      <td>{u.name}{u.id === currentUserId ? " (you)" : ""}</td>
+                      <td><span className={"chip " + (u.role === "admin" ? "role-admin" : "role-staff")}>{u.role === "admin" ? "Owner" : "Staff"}</span></td>
+                      <td className="pin-cell">{u.pin}</td>
+                      <td>
+                        <button className="btn-ghost small danger" onClick={() => removeUser(u.id)}
+                          disabled={u.id === currentUserId}>Remove</button>
+                      </td>
+                    </tr>
+                  ))}
+                </tbody>
+              </table>
+              <div className="svc-cat">Add a person</div>
+              <div className="edit-add">
+                <input value={userDraft.name} placeholder="Name"
+                  onChange={(e) => setUserDraft({ ...userDraft, name: e.target.value })} />
+                <input value={userDraft.pin} placeholder="PIN (4–6 digits)" inputMode="numeric" maxLength={6} className="narrow"
+                  onChange={(e) => setUserDraft({ ...userDraft, pin: e.target.value.replace(/\D/g, "") })} />
+                <select value={userDraft.role} className="narrow"
+                  onChange={(e) => setUserDraft({ ...userDraft, role: e.target.value })}>
+                  <option value="staff">Staff</option>
+                  <option value="admin">Owner</option>
+                </select>
+                <button className="btn-main small" onClick={addUser}>Add</button>
+              </div>
+              <p className="tiny left">Tip: to change someone's PIN, remove them and add them again with the new PIN. Every PIN must be unique — it's how the app knows who signed in.</p>
+            </section>
+          )}
+          {/* ================= SETTINGS (owner only) ================= */}
+          {tab === "settings" && isAdmin && (
+            <section className="panel">
+              <h2>Settings</h2>
+              <p className="muted">Changes save automatically and update everywhere — slips, receipts, and WhatsApp messages.</p>
+
+              <div className="svc-cat">Company details</div>
+              <div className="form two-col">
+                <label>Business name
+                  <input value={settings.shopName} onChange={(e) => setSettings({ ...settings, shopName: e.target.value })} />
+                </label>
+                <label>Business phone (shown on slips)
+                  <input value={settings.phone} onChange={(e) => setSettings({ ...settings, phone: e.target.value })} />
+                </label>
+                <label>Location
+                  <input value={settings.location} onChange={(e) => setSettings({ ...settings, location: e.target.value })} />
+                </label>
+                <label>Opening hours
+                  <input value={settings.hours} onChange={(e) => setSettings({ ...settings, hours: e.target.value })} />
+                </label>
+              </div>
+
+              <div className="svc-cat">Business rules</div>
+              <div className="form two-col">
+                <label>Express surcharge (%)
+                  <input type="number" min="0" max="200" value={settings.expressRate}
+                    onChange={(e) => { const v = parseFloat(e.target.value); setSettings({ ...settings, expressRate: isNaN(v) ? 0 : v }); }} />
+                </label>
+                <label>Collection default (days after drop-off)
+                  <input type="number" min="0" max="14" value={settings.turnaroundDays}
+                    onChange={(e) => { const v = parseInt(e.target.value, 10); setSettings({ ...settings, turnaroundDays: isNaN(v) ? 1 : v }); }} />
+                </label>
+                <label>Uncollected items policy (days, shown on slip)
+                  <input type="number" min="1" max="365" value={settings.policyDays}
+                    onChange={(e) => { const v = parseInt(e.target.value, 10); setSettings({ ...settings, policyDays: isNaN(v) ? 30 : v }); }} />
+                </label>
+                <label>Print format for slips &amp; receipts
+                  <select value={settings.printFormat}
+                    onChange={(e) => setSettings({ ...settings, printFormat: e.target.value })}>
+                    <option value="a4">A4 paper (normal printer)</option>
+                    <option value="thermal">80mm thermal (till receipt printer)</option>
+                  </select>
+                </label>
+              </div>
+
+              <div className="svc-cat">Payment methods</div>
+              <div className="setting-list">
+                {settings.payMethods.map((m) => (
+                  <span key={m} className="setting-item">
+                    {m}
+                    {settings.payMethods.length > 1 && (
+                      <button className="item-x" aria-label={`Remove ${m}`}
+                        onClick={() => setSettings({ ...settings, payMethods: settings.payMethods.filter((x) => x !== m) })}>✕</button>
+                    )}
+                  </span>
+                ))}
+              </div>
+              <div className="edit-add">
+                <input value={newMethod} placeholder="e.g. EasyWallet"
+                  onChange={(e) => setNewMethod(e.target.value)} />
+                <button className="btn-ghost small" onClick={() => {
+                  const m = newMethod.trim();
+                  if (!m) return;
+                  if (settings.payMethods.some((x) => x.toLowerCase() === m.toLowerCase())) { flash("That method is already listed."); return; }
+                  setSettings({ ...settings, payMethods: [...settings.payMethods, m] });
+                  setNewMethod("");
+                }}>Add</button>
+              </div>
+
+              <div className="svc-cat">Collection time slots</div>
+              <div className="setting-list">
+                {settings.slots.map((s) => (
+                  <span key={s} className="setting-item">
+                    {s}
+                    {settings.slots.length > 1 && (
+                      <button className="item-x" aria-label={`Remove ${s}`}
+                        onClick={() => setSettings({ ...settings, slots: settings.slots.filter((x) => x !== s) })}>✕</button>
+                    )}
+                  </span>
+                ))}
+              </div>
+              <div className="edit-add">
+                <input value={newSlot} placeholder="e.g. 09:00 – 12:00 (Sunday)"
+                  onChange={(e) => setNewSlot(e.target.value)} />
+                <button className="btn-ghost small" onClick={() => {
+                  const s = newSlot.trim();
+                  if (!s) return;
+                  if (settings.slots.includes(s)) { flash("That slot is already listed."); return; }
+                  setSettings({ ...settings, slots: [...settings.slots, s] });
+                  setNewSlot("");
+                }}>Add</button>
+              </div>
+
+              <div className="svc-cat">WhatsApp message · “Ready for collection”</div>
+              <p className="muted small-note">Placeholders the app fills in automatically: <code>{"{name}"}</code> customer's name · <code>{"{order}"}</code> order number · <code>{"{shop}"}</code> business name · <code>{"{balance}"}</code> balance due · <code>{"{hours}"}</code> opening hours · <code>{"{date}"}</code> collection date.</p>
+              <textarea className="msg-area" rows={4} value={settings.readyMsg}
+                onChange={(e) => setSettings({ ...settings, readyMsg: e.target.value })} />
+              <div className="msg-preview">
+                <b>Preview:</b> {readyText(previewOrder, settings)}
+              </div>
+              <button className="btn-ghost small" onClick={() => setSettings({ ...settings, readyMsg: DEFAULT_SETTINGS.readyMsg })}>Restore default message</button>
+
+              <div className="svc-cat">WhatsApp message · Overdue collection reminder</div>
+              <textarea className="msg-area" rows={4} value={settings.overdueMsg}
+                onChange={(e) => setSettings({ ...settings, overdueMsg: e.target.value })} />
+              <div className="msg-preview">
+                <b>Preview:</b> {overdueText(previewOrder, settings)}
+              </div>
+              <button className="btn-ghost small" onClick={() => setSettings({ ...settings, overdueMsg: DEFAULT_SETTINGS.overdueMsg })}>Restore default message</button>
+
+              <div className="svc-cat">WhatsApp message · Payment thank-you (opens the receipt message)</div>
+              <textarea className="msg-area" rows={3} value={settings.thanksMsg}
+                onChange={(e) => setSettings({ ...settings, thanksMsg: e.target.value })} />
+              <div className="msg-preview">
+                <b>Preview:</b> {fillTpl(settings.thanksMsg, previewOrder, settings)}
+              </div>
+              <button className="btn-ghost small" onClick={() => setSettings({ ...settings, thanksMsg: DEFAULT_SETTINGS.thanksMsg })}>Restore default message</button>
+
+              <div className="svc-cat">Slip footer note (use {"{days}"} for the policy days)</div>
+              <textarea className="msg-area" rows={3} value={settings.slipFooter}
+                onChange={(e) => setSettings({ ...settings, slipFooter: e.target.value })} />
+              <button className="btn-ghost small" onClick={() => setSettings({ ...settings, slipFooter: DEFAULT_SETTINGS.slipFooter })}>Restore default note</button>
+            </section>
+          )}
+        </main>
+
+        <footer className="ft no-print">
+          {settings.shopName} · Data saves automatically on this device.
+          {isAdmin && (
+            <span className="ft-actions">
+              <span className="ft-note">Last backup: {lastBackupTs ? label(lastBackupTs) : "never"}</span>
+              <button className="ft-link" onClick={() => backupData(false)}>⬇ Backup now</button>
+              <button className="ft-link" onClick={() => restoreInput.current && restoreInput.current.click()}>⬆ Restore</button>
+              <input ref={restoreInput} type="file" accept=".json,application/json" className="hidden-input"
+                onChange={(e) => { if (e.target.files[0]) restoreData(e.target.files[0]); e.target.value = ""; }} />
+              <button className="reset-link" onClick={resetAllData}>Reset all data</button>
+            </span>
+          )}
+        </footer>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ---------- shared pieces ---------- */
+
+const PAGE_META = {
+  dash: ["Dashboard", "Overview of today's laundry operations"],
+  new: ["New order", "Register the customer, count the items, take a deposit"],
+  orders: ["Orders", "Track progress, record payments, print slips and receipts"],
+  customers: ["Customers", "Everyone registered at the counter"],
+  reports: ["Reports", "Money collected, top items and payment methods"],
+  prices: ["Price list", "Your services and prices — changes apply to new orders"],
+  team: ["Team", "People and their sign-in PINs"],
+  settings: ["Settings", "Company details, business rules and message templates"],
+};
+
+function BarChart({ data }) {
+  const max = Math.max(...data.map((d) => d.amt), 1);
+  const w = 640, h = 170, pad = 5;
+  const bw = w / data.length;
+  return (
+    <svg viewBox={`0 0 ${w} ${h + 26}`} className="chart" role="img" aria-label="Daily collections bar chart">
+      {data.map((d, i) => {
+        const bh = Math.max((d.amt / max) * (h - 14), 3);
+        return (
+          <g key={i}>
+            <rect x={i * bw + pad} y={h - bh} width={bw - pad * 2} height={bh} rx="5"
+              className={d.amt > 0 ? "bar-on" : "bar-off"}>
+              <title>{d.lbl}: {fmt(d.amt)}</title>
+            </rect>
+            <text x={i * bw + bw / 2} y={h + 18} textAnchor="middle" className="bar-lbl">{d.lbl}</text>
+          </g>
+        );
+      })}
+    </svg>
+  );
+}
+
+function Cycle({ status }) {
+  const idx = STATUSES.indexOf(status);
+  return (
+    <div className="cycle">
+      {STATUSES.map((s, i) => (
+        <div key={s} className={"cy-step" + (i < idx ? " done" : i === idx ? " now" : "")}>
+          <span className="cy-dot" />
+          <span className="cy-label">{s}</span>
+        </div>
+      ))}
+    </div>
+  );
+}
+
+function Slip({ o, st }) {
+  const paid = paidOf(o);
+  const balance = balanceOf(o);
+  const tagBase = o.id.replace(/\D/g, "");
+  const pieces = [];
+  o.items.forEach((it) => { for (let i = 0; i < it.qty; i++) pieces.push(it.name); });
+  return (
+    <div className="doc">
+      <div className="doc-head">
+        <div className="doc-shop">{st.shopName}</div>
+        <div className="doc-line">{shopLine(st)}</div>
+      </div>
+      <div className="doc-title">LAUNDRY SLIP</div>
+      <div className="doc-meta">
+        <div><span>Order no.</span><b>{o.id}</b></div>
+        <div><span>Date</span><b>{label(o.ts)}</b></div>
+        <div><span>Served by</span><b>{o.takenBy || "-"}</b></div>
+        <div><span>Customer</span><b>{o.customerName}</b></div>
+        <div><span>Phone</span><b>{o.phone}</b></div>
+        <div><span>Collection</span><b>{o.collectDate} · {o.collectSlot}</b></div>
+        {o.express && <div><span>Service</span><b>EXPRESS (24h)</b></div>}
+      </div>
+      <table className="doc-items">
+        <thead><tr><th>Item</th><th>Qty</th><th>Price</th><th>Amount</th></tr></thead>
+        <tbody>
+          {o.items.map((it, i) => (
+            <tr key={i}><td>{it.name}</td><td>{it.qty}</td><td>{fmt(it.price)}</td><td>{fmt(it.price * it.qty)}</td></tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="doc-totals">
+        <div><span>Subtotal</span><b>{fmt(o.subtotal)}</b></div>
+        {o.expressFee > 0 && <div><span>Express service</span><b>{fmt(o.expressFee)}</b></div>}
+        {o.discount > 0 && <div><span>Discount</span><b>−{fmt(o.discount)}</b></div>}
+        <div className="doc-grand"><span>TOTAL</span><b>{fmt(o.total)}</b></div>
+        <div><span>Paid</span><b>{fmt(paid)}</b></div>
+        <div><span>Balance</span><b>{fmt(balance)}</b></div>
+      </div>
+      <div className="doc-tags">
+        <div className="doc-tags-title">GARMENT TAGS · {pieces.length} piece{pieces.length !== 1 ? "s" : ""}</div>
+        {pieces.map((name, i) => (
+          <div key={i} className="doc-tag"><b>{tagBase}-{i + 1}</b> {name}</div>
+        ))}
+      </div>
+      {o.notes && <div className="doc-notes">Note: {o.notes}</div>}
+      <div className="doc-foot">{st.slipFooter.replace(/{days}/g, st.policyDays)}</div>
+    </div>
+  );
+}
+
+function Receipt({ o, st }) {
+  const paid = paidOf(o);
+  const balance = balanceOf(o);
+  const last = o.payments[o.payments.length - 1];
+  return (
+    <div className="doc">
+      <div className="doc-head">
+        <div className="doc-shop">{st.shopName}</div>
+        <div className="doc-line">{shopLine(st)}</div>
+      </div>
+      <div className="doc-title">RECEIPT</div>
+      <div className="doc-meta">
+        <div><span>Receipt no.</span><b>R-{o.id}-{o.payments.length}</b></div>
+        <div><span>Date</span><b>{last ? label(last.ts) : ""}</b></div>
+        <div><span>Received from</span><b>{o.customerName}</b></div>
+        <div><span>For order</span><b>{o.id}</b></div>
+        {last && last.by && <div><span>Served by</span><b>{last.by}</b></div>}
+      </div>
+      <table className="doc-items">
+        <thead><tr><th>Payment</th><th>Method</th><th>Amount</th></tr></thead>
+        <tbody>
+          {o.payments.map((p, i) => (
+            <tr key={i}>
+              <td>{label(p.ts)}{p.amount < 0 ? " (reversal)" : ""}</td>
+              <td>{p.method}</td>
+              <td>{fmt(p.amount)}</td>
+            </tr>
+          ))}
+        </tbody>
+      </table>
+      <div className="doc-totals">
+        <div><span>Order total</span><b>{fmt(o.total)}</b></div>
+        <div className="doc-grand"><span>TOTAL PAID</span><b>{fmt(paid)}</b></div>
+        <div><span>Balance due</span><b>{fmt(balance)}</b></div>
+      </div>
+      <div className="doc-foot">
+        {balance === 0 ? "Paid in full — thank you!" : "Balance payable on collection. Thank you!"}
+      </div>
+    </div>
+  );
+}
+
+/* ------------------------------ styles ------------------------------ */
+
+const CSS = `
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=IBM+Plex+Mono:wght@500&display=swap');
+
+:root {
+  --blue: #2563EB;
+  --blue-dark: #1D4ED8;
+  --blue-soft: #EFF4FF;
+  --ink: #0F172A;
+  --muted: #64748B;
+  --bg: #F1F5F9;
+  --card: #FFFFFF;
+  --line: #E2E8F0;
+  --green: #16A34A;
+  --red: #DC2626;
+  --amber: #B45309;
+  --radius: 12px;
+}
+* { box-sizing: border-box; }
+.app { min-height: 100vh; background: var(--bg); color: var(--ink); font-family: 'Inter', system-ui, sans-serif; font-size: 14.5px; }
+h1 { font-size: 26px; font-weight: 800; margin: 0; letter-spacing: -0.02em; }
+h2 { font-size: 16.5px; font-weight: 700; margin: 0 0 4px; letter-spacing: -0.01em; }
+h2.mt { margin-top: 26px; }
+.muted { color: var(--muted); margin: 0 0 14px; font-size: 13.5px; }
+.tiny { font-size: 12px; color: var(--muted); text-align: center; margin: 10px 0 0; }
+.tiny.left { text-align: left; }
+.center-text { text-align: center; }
+
+/* ---------- layout: sidebar + main ---------- */
+.layout { display: flex; min-height: 100vh; }
+.sidebar { width: 236px; flex-shrink: 0; background: var(--card); border-right: 1px solid var(--line); display: flex; flex-direction: column; position: sticky; top: 0; height: 100vh; }
+.sb-brand { display: flex; align-items: center; gap: 10px; padding: 18px 16px 14px; border-bottom: 1px solid var(--line); }
+.sb-logo { width: 38px; height: 38px; border-radius: 10px; background: var(--blue); display: grid; place-items: center; font-size: 19px; flex-shrink: 0; }
+.sb-brand b { display: block; font-size: 14.5px; font-weight: 800; letter-spacing: -0.01em; line-height: 1.2; }
+.sb-brand span { display: block; font-size: 11.5px; color: var(--muted); }
+.sb-nav { padding: 12px 10px; display: grid; gap: 3px; flex: 1; overflow-y: auto; }
+.sb-nav button { display: flex; align-items: center; gap: 11px; width: 100%; border: 0; background: transparent; color: #334155; font: inherit; font-weight: 600; font-size: 14px; padding: 10px 13px; border-radius: 10px; cursor: pointer; text-align: left; transition: background 0.12s ease, color 0.12s ease; }
+.sb-nav button i { font-style: normal; font-size: 16px; width: 20px; text-align: center; }
+.sb-nav button:hover { background: var(--bg); }
+.sb-nav button.on { background: var(--blue); color: #fff; }
+.sb-badge { margin-left: auto; background: var(--blue-soft); color: var(--blue-dark); font-size: 11px; font-weight: 700; font-style: normal; padding: 2px 8px; border-radius: 999px; }
+.sb-nav button.on .sb-badge { background: rgba(255,255,255,0.22); color: #fff; }
+.sb-foot { border-top: 1px solid var(--line); padding: 12px 14px; display: grid; gap: 9px; }
+.sb-user { display: flex; align-items: center; gap: 9px; }
+.sb-avatar { width: 32px; height: 32px; border-radius: 999px; background: var(--blue-soft); color: var(--blue-dark); display: grid; place-items: center; font-weight: 800; font-size: 13px; }
+.sb-user b { display: block; font-size: 13px; line-height: 1.2; }
+.sb-user span { display: block; font-size: 11.5px; color: var(--muted); }
+.btn-lock { border: 1px solid var(--line); background: #fff; color: var(--muted); font: inherit; font-weight: 600; font-size: 13px; padding: 8px 12px; border-radius: 9px; cursor: pointer; transition: background 0.12s ease; }
+.btn-lock:hover { background: var(--bg); }
+
+.main-col { flex: 1; min-width: 0; display: flex; flex-direction: column; }
+.wrap { width: 100%; max-width: 1160px; margin: 0 auto; padding: 24px clamp(14px, 3vw, 32px) 8px; flex: 1; }
+.page-head { margin-bottom: 18px; }
+.page-head p { margin: 3px 0 0; color: var(--muted); font-size: 14px; }
+
+.panel { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 20px; margin-bottom: 16px; }
+.panel-head { display: flex; justify-content: space-between; align-items: baseline; gap: 10px; margin-bottom: 8px; }
+.panel-total { font-weight: 800; font-size: 18px; color: var(--blue-dark); }
+
+/* ---------- login ---------- */
+.login-wrap { min-height: 100vh; display: grid; place-items: center; padding: 20px; background: var(--bg); }
+.login-card { background: var(--card); border: 1px solid var(--line); border-radius: 16px; padding: 36px 32px; box-shadow: 0 12px 34px rgba(15,23,42,0.08); width: min(400px, 100%); text-align: center; }
+.login-title { font-size: 21px; margin: 10px 0 2px; }
+.brand-drop.big { display: inline-grid; place-items: center; width: 58px; height: 58px; border-radius: 15px; background: var(--blue); font-size: 28px; }
+.pin-row { display: flex; gap: 8px; justify-content: center; margin-top: 16px; }
+.pin-field { max-width: 150px; text-align: center; letter-spacing: 7px; font-family: 'IBM Plex Mono', monospace; font-size: 18px; }
+.pin-error { color: var(--red); font-weight: 600; font-size: 13.5px; margin: 10px 0 0; }
+
+.toast { position: fixed; left: 50%; transform: translateX(-50%); bottom: 22px; background: var(--ink); color: #fff; padding: 11px 18px; border-radius: 10px; font-size: 13.5px; box-shadow: 0 10px 26px rgba(15,23,42,0.35); z-index: 90; max-width: min(92vw, 520px); animation: toastIn 0.25s ease; }
+@keyframes toastIn { from { opacity: 0; transform: translate(-50%, 12px); } to { opacity: 1; transform: translate(-50%, 0); } }
+
+/* ---------- forms & buttons ---------- */
+.form { display: grid; gap: 12px; max-width: 460px; }
+.form.two-col { max-width: none; grid-template-columns: 1fr 1fr; }
+.form label { display: grid; gap: 5px; font-size: 12.5px; font-weight: 600; color: var(--muted); }
+.form .span2 { grid-column: 1 / -1; }
+input, select, textarea { font: inherit; color: var(--ink); padding: 9px 12px; border: 1px solid #CBD5E1; border-radius: 9px; background: #fff; width: 100%; transition: border-color 0.15s ease, box-shadow 0.15s ease; }
+input:focus, select:focus, textarea:focus { outline: none; border-color: var(--blue); box-shadow: 0 0 0 3px rgba(37,99,235,0.15); }
+.btn-main { border: 0; background: var(--blue); color: #fff; font: inherit; font-weight: 700; font-size: 14px; padding: 10px 20px; border-radius: 9px; cursor: pointer; transition: background 0.15s ease, transform 0.12s ease; }
+.btn-main:hover { background: var(--blue-dark); }
+.btn-main:active { transform: scale(0.97); }
+.btn-main.small { padding: 8px 14px; font-size: 13px; }
+.btn-main.w-full { width: 100%; margin-top: 12px; }
+.btn-main.danger-bg { background: var(--red); }
+.btn-ghost { border: 1px solid #CBD5E1; background: #fff; color: #475569; font: inherit; font-weight: 600; font-size: 13.5px; padding: 9px 16px; border-radius: 9px; cursor: pointer; transition: background 0.12s ease; }
+.btn-ghost:hover { background: var(--bg); }
+.btn-ghost.small { padding: 7px 13px; font-size: 13px; }
+.btn-ghost.danger { color: var(--red); border-color: #FECACA; }
+.btn-main:focus-visible, .btn-ghost:focus-visible { outline: 2px solid var(--ink); outline-offset: 2px; }
+.btn-wa { display: inline-flex; align-items: center; gap: 6px; border: 0; background: #22C55E; color: #fff; text-decoration: none; font: inherit; font-weight: 700; padding: 10px 20px; border-radius: 9px; cursor: pointer; }
+.btn-wa:hover { background: #16A34A; }
+
+/* ---------- stat cards ---------- */
+.report-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; margin-bottom: 14px; }
+.stat-row { display: grid; grid-template-columns: repeat(auto-fit, minmax(170px, 1fr)); gap: 12px; margin-bottom: 16px; }
+.stat { background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 16px 18px; transition: transform 0.16s ease, box-shadow 0.16s ease; }
+.stat:hover { transform: translateY(-2px); box-shadow: 0 8px 20px rgba(15,23,42,0.08); }
+.stat-lbl { display: block; font-size: 11px; font-weight: 700; letter-spacing: 0.07em; text-transform: uppercase; color: var(--muted); margin-bottom: 6px; }
+.stat b { display: block; font-size: 23px; font-weight: 800; letter-spacing: -0.02em; }
+.stat span:last-child { font-size: 12px; color: var(--muted); }
+.c-blue { color: var(--blue-dark); }
+.c-green { color: var(--green); }
+.c-red { color: var(--red); }
+.c-amber { color: var(--amber); }
+
+/* chart */
+.chart { width: 100%; height: auto; display: block; }
+.bar-on { fill: var(--blue); }
+.bar-off { fill: #E2E8F0; }
+.bar-lbl { font-size: 11px; fill: var(--muted); font-family: 'Inter', sans-serif; }
+
+/* ---------- services ---------- */
+.order-grid { display: grid; grid-template-columns: 1fr 340px; gap: 16px; align-items: start; }
+.svc-group { margin-bottom: 6px; }
+.svc-cat { font-size: 11px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; color: var(--blue-dark); margin: 18px 0 8px; }
+.svc-row { display: flex; align-items: center; gap: 12px; padding: 8px 4px; border-bottom: 1px solid #F1F5F9; }
+.svc-icon { font-size: 19px; width: 28px; text-align: center; }
+.svc-info { flex: 1; }
+.svc-info div { font-weight: 600; }
+.svc-info span { font-size: 12.5px; color: var(--muted); }
+.qty { display: flex; align-items: center; gap: 2px; }
+.qty button { width: 30px; height: 30px; border-radius: 9px; border: 1px solid #CBD5E1; background: #fff; color: var(--ink); font-size: 16px; font-weight: 700; cursor: pointer; line-height: 1; transition: all 0.12s ease; }
+.qty button:hover { border-color: var(--blue); color: var(--blue); background: var(--blue-soft); }
+.qty button:active { transform: scale(0.9); }
+.qty span { min-width: 30px; text-align: center; font-weight: 700; font-variant-numeric: tabular-nums; }
+.express { display: flex; gap: 10px; align-items: center; margin-top: 16px; background: #FFFBEB; border: 1px solid #FDE68A; border-radius: 10px; padding: 11px 13px; cursor: pointer; }
+.express input { width: 18px; height: 18px; accent-color: var(--blue); }
+.express div div { font-weight: 700; }
+.express span { font-size: 12.5px; color: var(--muted); }
+.express-inline { display: flex; align-items: center; gap: 8px; flex-direction: row !important; font-size: 14px !important; color: var(--ink) !important; }
+.express-inline input { width: 18px; }
+.phone-wrap { display: flex; align-items: stretch; }
+.phone-wrap .phone-cc { display: flex; align-items: center; padding: 0 11px; background: var(--bg); border: 1px solid #CBD5E1; border-right: 0; border-radius: 9px 0 0 9px; font-weight: 700; color: var(--muted); font-size: 13.5px; }
+.phone-wrap input { border-radius: 0 9px 9px 0; }
+
+/* ---------- order summary card (was manila ticket) ---------- */
+.ticket { position: sticky; top: 16px; background: var(--card); border: 1px solid var(--line); border-radius: var(--radius); padding: 18px; }
+.ticket-hole, .ticket-serration { display: none; }
+.ticket-head { font-size: 11px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: var(--muted); border-bottom: 1px solid var(--line); padding-bottom: 10px; margin-bottom: 12px; }
+.ticket-empty { text-align: center; font-size: 13px; color: var(--muted); padding: 26px 4px; line-height: 1.7; }
+.ticket-lines { display: grid; gap: 8px; font-size: 13.5px; }
+.ticket-lines > div { display: flex; justify-content: space-between; gap: 8px; }
+.ticket-lines .rule { border-top: 1px dashed var(--line); height: 0; padding: 0; }
+.ticket-total { font-size: 17px; font-weight: 800; }
+.ticket-total b { color: var(--blue-dark); }
+.btn-clear { display: block; width: 100%; margin-top: 8px; border: 1px dashed #CBD5E1; background: transparent; color: var(--muted); font: inherit; font-size: 13px; font-weight: 600; padding: 8px; border-radius: 9px; cursor: pointer; transition: background 0.12s ease; }
+.btn-clear:hover { background: var(--bg); }
+
+/* ---------- status cycle ---------- */
+.cycle { display: flex; margin: 12px 0 10px; max-width: 560px; }
+.cy-step { flex: 1; position: relative; text-align: center; }
+.cy-step:not(:last-child)::after { content: ""; position: absolute; top: 6px; left: 50%; width: 100%; height: 3px; background: var(--line); z-index: 0; }
+.cy-step.done:not(:last-child)::after { background: var(--blue); }
+.cy-dot { position: relative; z-index: 1; display: inline-block; width: 15px; height: 15px; border-radius: 999px; background: #fff; border: 3px solid #CBD5E1; }
+.cy-step.done .cy-dot { background: var(--blue); border-color: var(--blue); }
+.cy-step.now .cy-dot { border-color: var(--blue); background: #fff; box-shadow: 0 0 0 4px rgba(37,99,235,0.2); animation: pulse 1.8s infinite; }
+@keyframes pulse { 50% { box-shadow: 0 0 0 7px rgba(37,99,235,0.1); } }
+@media (prefers-reduced-motion: reduce) { .cy-step.now .cy-dot { animation: none; } }
+.cy-label { display: block; font-size: 10px; margin-top: 5px; line-height: 1.25; color: var(--muted); }
+.cy-step.now .cy-label { font-weight: 700; color: var(--ink); }
+
+/* ---------- chips & toolbar ---------- */
+.chip { font-size: 11px; font-weight: 700; padding: 4px 11px; border-radius: 999px; white-space: nowrap; }
+.pay-paid { background: #DCFCE7; color: #15803D; }
+.pay-partial { background: #FEF3C7; color: var(--amber); }
+.pay-unpaid { background: #FEE2E2; color: var(--red); }
+.express-chip { background: var(--ink); color: #fff; margin-left: 8px; letter-spacing: 0.08em; }
+.cancel-chip { background: var(--red); color: #fff; margin-left: 8px; letter-spacing: 0.06em; }
+.edited-chip { background: var(--bg); color: var(--muted); margin-left: 8px; }
+.order-toolbar { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; margin-bottom: 14px; }
+.order-toolbar .search { max-width: 320px; }
+.chip-row { display: flex; gap: 6px; flex-wrap: wrap; }
+.chip-btn { border: 1px solid #CBD5E1; background: #fff; color: #475569; font: inherit; font-size: 13px; font-weight: 600; padding: 7px 14px; border-radius: 9px; cursor: pointer; transition: all 0.12s ease; }
+.chip-btn:hover { background: var(--bg); }
+.chip-btn.on { background: var(--blue); border-color: var(--blue); color: #fff; }
+
+/* ---------- orders ---------- */
+.admin-order { padding: 16px 18px; transition: box-shadow 0.16s ease; }
+.admin-order:hover { box-shadow: 0 6px 18px rgba(15,23,42,0.07); }
+.order-cancelled { opacity: 0.75; background: #FEF6F6; }
+.cancel-note { color: var(--red); font-weight: 600; }
+.ao-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; font-size: 15px; }
+.ao-meta { display: flex; gap: 14px; flex-wrap: wrap; font-size: 12.5px; color: var(--muted); margin: 6px 0; }
+.ao-items { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; font-size: 13px; background: var(--bg); border-radius: 9px; padding: 8px 12px; margin: 6px 0 2px; }
+.ao-items b { margin-left: auto; }
+.ao-actions { display: flex; gap: 8px; align-items: center; flex-wrap: wrap; margin-top: 8px; }
+.pay-form, .cancel-form { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; margin-top: 10px; }
+.pay-form input, .cancel-form input { max-width: 240px; padding: 7px 10px; font-size: 13px; }
+.pay-form select { max-width: 170px; padding: 7px 10px; font-size: 13px; }
+.pay-log { margin-top: 9px; font-size: 12px; color: var(--muted); display: flex; gap: 14px; flex-wrap: wrap; }
+.pay-reversal { color: var(--red); }
+.pay-reversed { text-decoration: line-through; opacity: 0.7; }
+.reverse-btn { border: 0; background: none; color: var(--red); font-size: 14px; cursor: pointer; padding: 0 2px; margin-left: 3px; }
+.wa-mini { display: inline-block; font-size: 12.5px; font-weight: 700; color: #15803D; text-decoration: none; border: 1px solid #86EFAC; background: #F0FDF4; padding: 7px 12px; border-radius: 9px; transition: background 0.12s ease; }
+.wa-mini:hover { background: #DCFCE7; }
+
+/* ---------- edit overlay ---------- */
+.edit-panel { background: #fff; max-width: 560px; margin: 0 auto; border-radius: 14px; padding: 22px; box-shadow: 0 20px 60px rgba(0,0,0,0.35); animation: popIn 0.25s ease both; }
+.edit-adders { display: grid; gap: 8px; margin: 12px 0 4px; }
+.edit-add { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; margin: 6px 0; }
+.edit-add input, .edit-add select { flex: 1; min-width: 140px; padding: 8px 10px; font-size: 13.5px; }
+.edit-add .narrow { max-width: 130px; flex: 0 1 auto; }
+.edit-fields { margin-top: 12px; }
+.edit-total { margin: 14px 0 12px; font-size: 14px; background: var(--blue-soft); border-radius: 9px; padding: 10px 12px; }
+.edit-actions { display: flex; gap: 8px; }
+@keyframes popIn { from { opacity: 0; transform: translateY(14px) scale(0.98); } to { opacity: 1; transform: none; } }
+
+/* ---------- customer search (combo box) ---------- */
+.cust-search { position: relative; max-width: 460px; }
+.cust-combo { position: relative; }
+.cust-combo input { padding-right: 34px; }
+.combo-arrow { position: absolute; right: 12px; top: 50%; transform: translateY(-50%); color: var(--muted); font-size: 12px; pointer-events: none; }
+.cust-results { position: absolute; left: 0; right: 0; top: 46px; z-index: 30; background: #fff; border: 1px solid var(--line); border-radius: 10px; overflow-y: auto; max-height: 280px; box-shadow: 0 14px 34px rgba(15,23,42,0.14); animation: fadeUp 0.15s ease; }
+.cust-result { display: flex; justify-content: space-between; align-items: center; gap: 10px; width: 100%; text-align: left; border: 0; background: #fff; font: inherit; padding: 11px 14px; cursor: pointer; border-bottom: 1px solid #F1F5F9; transition: background 0.12s ease; }
+.cust-result:last-child { border-bottom: 0; }
+.cust-result:hover { background: var(--blue-soft); }
+.cust-result span { color: var(--muted); font-size: 12.5px; }
+.cust-none { padding: 11px 14px; color: var(--muted); font-size: 13.5px; }
+.new-cust-btn { margin-top: 10px; }
+.cust-selected { display: flex; justify-content: space-between; align-items: center; gap: 10px; max-width: 460px; background: var(--blue-soft); border: 1px solid #BFDBFE; border-radius: 10px; padding: 11px 14px; }
+.new-cust-head { display: flex; justify-content: space-between; align-items: center; gap: 10px; font-size: 13px; font-weight: 700; color: var(--blue-dark); }
+
+/* ---------- dashboard rows ---------- */
+.report-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; align-items: start; }
+.dash-row { display: flex; justify-content: space-between; align-items: center; gap: 10px; flex-wrap: wrap; padding: 10px 2px; border-bottom: 1px solid #F1F5F9; font-size: 14px; }
+.dash-row:last-child { border-bottom: 0; }
+.dash-sub { display: block; font-size: 12px; color: var(--muted); margin-top: 2px; }
+.dash-acts { display: flex; gap: 6px; align-items: center; }
+.bar-cell { width: 40%; }
+.bar { height: 9px; background: var(--blue); border-radius: 999px; min-width: 4px; }
+
+/* ---------- tables ---------- */
+.table { width: 100%; border-collapse: collapse; font-size: 13.5px; }
+.table th { text-align: left; font-size: 11px; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); padding: 9px 10px; border-bottom: 1px solid var(--line); background: #F8FAFC; }
+.table td { padding: 10px; border-bottom: 1px solid #F1F5F9; }
+.table tr:hover td { background: #FAFBFD; }
+.table .num, .table th.num { text-align: right; }
+.price-input { max-width: 110px; font-weight: 600; }
+.cust-edit-row input { padding: 6px 8px; font-size: 13px; }
+.role-admin { background: var(--blue); color: #fff; }
+.role-staff { background: var(--bg); color: var(--muted); }
+.pin-cell { font-family: 'IBM Plex Mono', monospace; letter-spacing: 2px; }
+
+/* ---------- settings ---------- */
+.msg-area { max-width: 640px; resize: vertical; margin-bottom: 8px; }
+.msg-preview { max-width: 640px; background: #F0FDF4; border: 1px solid #BBF7D0; border-radius: 10px; padding: 10px 13px; font-size: 13px; margin: 4px 0 10px; line-height: 1.5; }
+.small-note { font-size: 12.5px; }
+.small-note code { background: var(--bg); padding: 1px 5px; border-radius: 5px; font-size: 12px; }
+.setting-list { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 8px; }
+.setting-item { display: inline-flex; align-items: center; gap: 7px; background: var(--bg); border: 1px solid var(--line); border-radius: 9px; padding: 7px 8px 7px 14px; font-size: 13.5px; font-weight: 600; }
+.item-x { border: 0; background: #fff; color: var(--red); width: 22px; height: 22px; border-radius: 999px; cursor: pointer; font-size: 11px; font-weight: 700; line-height: 1; transition: background 0.12s ease; }
+.item-x:hover { background: #FEE2E2; }
+
+/* ---------- footer ---------- */
+.ft { text-align: center; font-size: 12px; color: var(--muted); padding: 14px 12px 18px; }
+.ft-actions { display: inline-flex; gap: 12px; margin-left: 12px; flex-wrap: wrap; }
+.ft-link { border: 0; background: none; color: var(--blue-dark); font: inherit; font-weight: 700; cursor: pointer; text-decoration: underline; padding: 0; }
+.ft-note { color: var(--muted); font-weight: 600; }
+.reset-link { border: 0; background: none; color: var(--red); font: inherit; font-weight: 700; cursor: pointer; text-decoration: underline; padding: 0; }
+.hidden-input { display: none; }
+button:disabled { opacity: 0.45; cursor: not-allowed; }
+
+/* ---------- print docs (unchanged look for paper) ---------- */
+.print-overlay { position: fixed; inset: 0; z-index: 80; background: rgba(15,23,42,0.55); overflow: auto; padding: 26px 14px 100px; }
+.print-doc { background: #fff; max-width: 420px; margin: 0 auto; border-radius: 8px; box-shadow: 0 20px 60px rgba(0,0,0,0.4); animation: popIn 0.25s ease both; }
+.print-actions { position: fixed; bottom: 20px; left: 50%; transform: translateX(-50%); display: flex; gap: 10px; z-index: 81; flex-wrap: wrap; justify-content: center; }
+.print-actions .btn-ghost { background: #fff; }
+.shell-dim { filter: blur(1px); pointer-events: none; user-select: none; }
+
+.doc { font-family: 'IBM Plex Mono', ui-monospace, monospace; color: #111; padding: 22px 20px; font-size: 12.5px; }
+.doc-head { text-align: center; border-bottom: 2px solid #111; padding-bottom: 8px; }
+.doc-shop { font-weight: 700; font-size: 15px; letter-spacing: 0.02em; }
+.doc-line { font-size: 11px; margin-top: 2px; }
+.doc-title { text-align: center; font-weight: 700; letter-spacing: 0.3em; margin: 10px 0; font-size: 13px; }
+.doc-meta { display: grid; gap: 4px; border-bottom: 1.5px dashed #999; padding-bottom: 10px; margin-bottom: 8px; }
+.doc-meta div { display: flex; justify-content: space-between; gap: 10px; }
+.doc-meta span { color: #555; }
+.doc-items { width: 100%; border-collapse: collapse; margin: 4px 0 8px; }
+.doc-items th { text-align: left; font-size: 10.5px; letter-spacing: 0.06em; border-bottom: 1px solid #111; padding: 4px 2px; }
+.doc-items td { padding: 4px 2px; border-bottom: 1px dotted #ccc; }
+.doc-items th:last-child, .doc-items td:last-child, .doc-items th:nth-child(3), .doc-items td:nth-child(3) { text-align: right; }
+.doc-totals { display: grid; gap: 4px; border-top: 1.5px dashed #999; padding-top: 8px; }
+.doc-totals div { display: flex; justify-content: space-between; }
+.doc-grand { font-size: 15px; font-weight: 700; }
+.doc-tags { margin-top: 12px; border: 1px dashed #999; padding: 8px 10px; }
+.doc-tags-title { font-size: 10.5px; letter-spacing: 0.08em; font-weight: 700; margin-bottom: 5px; }
+.doc-tag { font-size: 11.5px; padding: 2px 0; }
+.doc-notes { margin-top: 10px; font-size: 11.5px; border: 1px dashed #999; padding: 7px 9px; }
+.doc-foot { text-align: center; margin-top: 14px; font-size: 11px; color: #444; line-height: 1.6; border-top: 2px solid #111; padding-top: 10px; }
+
+.print-doc.thermal { max-width: 300px; }
+.print-doc.thermal .doc { font-size: 11px; padding: 12px 10px; }
+.print-doc.thermal .doc-shop { font-size: 13px; }
+.print-doc.thermal .doc-title { letter-spacing: 0.2em; font-size: 11.5px; }
+.print-doc.thermal .doc-grand { font-size: 13px; }
+.print-doc.thermal .doc-items th { font-size: 9.5px; }
+
+@media print {
+  .no-print { display: none !important; }
+  .shell { display: none !important; }
+  .app { background: #fff !important; padding: 0 !important; }
+  .print-overlay { position: static !important; background: none !important; padding: 0 !important; overflow: visible !important; }
+  .print-doc { box-shadow: none !important; max-width: 100% !important; border-radius: 0 !important; }
+  .print-doc.thermal { width: 80mm !important; max-width: 80mm !important; margin: 0 !important; }
+}
+
+/* ---------- loading + motion ---------- */
+.loading-screen { display: grid; place-items: center; }
+.loading-card { display: grid; place-items: center; gap: 10px; font-weight: 600; color: var(--muted); padding: 60px 20px; }
+.loading-card .brand-drop { display: grid; place-items: center; width: 56px; height: 56px; border-radius: 14px; background: var(--blue); font-size: 26px; animation: bob 1.2s ease-in-out infinite; }
+@keyframes bob { 50% { transform: translateY(-8px); } }
+main.wrap > section { animation: fadeUp 0.28s ease both; }
+@keyframes fadeUp { from { opacity: 0; transform: translateY(8px); } to { opacity: 1; transform: none; } }
+@media (prefers-reduced-motion: reduce) {
+  main.wrap > section, .toast, .print-doc, .edit-panel { animation: none; }
+  .loading-card .brand-drop { animation: none; }
+  .stat, .admin-order { transition: none; }
+}
+
+/* ---------- responsive ---------- */
+@media (max-width: 900px) {
+  .layout { flex-direction: column; }
+  .sidebar { width: 100%; height: auto; position: static; border-right: 0; border-bottom: 1px solid var(--line); }
+  .sb-nav { display: flex; overflow-x: auto; padding: 8px 10px; gap: 4px; }
+  .sb-nav button { width: auto; white-space: nowrap; padding: 8px 12px; font-size: 13px; }
+  .sb-foot { flex-direction: row; display: flex; justify-content: space-between; align-items: center; padding: 8px 14px; }
+  .order-grid { grid-template-columns: 1fr; }
+  .ticket { position: static; }
+  .form.two-col { grid-template-columns: 1fr; }
+  .report-grid { grid-template-columns: 1fr; }
+  .cy-label { font-size: 9px; }
+}
+`;
+
+ReactDOM.createRoot(document.getElementById('root')).render(<LaundryApp />);
+</script>
+</body>
+</html>
