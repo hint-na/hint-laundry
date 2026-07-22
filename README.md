@@ -12,6 +12,7 @@ even with no internet.
 | `index.html` | Small page shell: fonts, icons, script tags, service-worker registration |
 | `app.jsx` | **The app source — edit this one** (React JSX) |
 | `app.js` | Compiled copy of `app.jsx` that the browser actually runs |
+| `status.html` | Public customer tracking page ("where's my laundry?") |
 | `sw.js` | Service worker — caches everything for offline use |
 | `manifest.webmanifest` | Home-screen install details (name, icons, colors) |
 | `vendor/` | React and the Excel library, self-hosted |

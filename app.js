@@ -911,6 +911,15 @@ function LaundryApp() {
       flash("Couldn't copy automatically — select and copy the code shown below.");
     }
   };
+  const trackUrl = o => cloudRef.current ? new URL("status.html", window.location.href).href + `?shop=${cloudRef.current.shopId}&order=${encodeURIComponent(o.id)}` : null;
+  const withTrack = (text, o) => {
+    const u = trackUrl(o);
+    return u ? `${text}\n\nTrack your order here: ${u}` : text;
+  };
+  const stampOrder = (orderId, field) => setOrders(os => os.map(o => o.id === orderId ? {
+    ...o,
+    [field]: Date.now()
+  } : o));
   const [newMethod, setNewMethod] = useState("");
   const [newSlot, setNewSlot] = useState("");
   const previewOrder = {
@@ -1843,6 +1852,23 @@ function LaundryApp() {
     const outstanding = live.reduce((a, o) => a + balanceOf(o), 0);
     const orderValue = pOrders.reduce((a, o) => a + o.total, 0);
     const discounts = pOrders.reduce((a, o) => a + (o.discount || 0), 0);
+    const readyDurs = [];
+    pOrders.forEach(o => {
+      const rec = (o.statusHistory || []).find(h => h.status === "Received");
+      const rdy = (o.statusHistory || []).find(h => h.status === "Ready for collection");
+      if (rec && rdy && rdy.ts > rec.ts) readyDurs.push(rdy.ts - rec.ts);
+    });
+    const avgReadyH = readyDurs.length ? readyDurs.reduce((a, b) => a + b, 0) / readyDurs.length / 3600000 : null;
+    const collectedOrders = pOrders.filter(o => o.status === DONE_STATUS);
+    const onTime = collectedOrders.filter(o => {
+      const col = [...(o.statusHistory || [])].reverse().find(h => h.status === DONE_STATUS);
+      return col && o.collectDate && localISO(new Date(col.ts)) <= o.collectDate;
+    }).length;
+    const custCounts = {};
+    live.forEach(o => {
+      custCounts[o.customerId] = (custCounts[o.customerId] || 0) + 1;
+    });
+    const repeat = pOrders.filter(o => custCounts[o.customerId] > 1).length;
     return {
       count: pOrders.length,
       revenue,
@@ -1853,7 +1879,11 @@ function LaundryApp() {
       byMethod: Object.entries(byMethod).sort((a, b) => b[1] - a[1]),
       topItems,
       express: pOrders.filter(o => o.express).length,
-      cancelled: orders.filter(o => o.cancelled && (o.ts || 0) >= start).length
+      cancelled: orders.filter(o => o.cancelled && (o.ts || 0) >= start).length,
+      avgReadyH,
+      onTimeRate: collectedOrders.length ? onTime / collectedOrders.length : null,
+      collectedCount: collectedOrders.length,
+      repeatRate: pOrders.length ? repeat / pOrders.length : null
     };
   }, [orders, period]);
   const openCount = orders.filter(o => o.status !== DONE_STATUS && !o.cancelled).length;
@@ -1873,6 +1903,8 @@ function LaundryApp() {
       if ((p.ts || 0) >= st) cashToday += p.amount;
     }));
     const outstanding = live.reduce((a, o) => a + balanceOf(o), 0);
+    const now = Date.now();
+    const toMessage = ready.filter(o => !o.notifiedReadyTs).length + overdue.filter(o => !o.lastReminderTs || now - o.lastReminderTs > 24 * 3600000).length + owing.filter(o => !o.lastReminderTs || now - o.lastReminderTs > 3 * 24 * 3600000).length;
     return {
       receivedToday,
       ready,
@@ -1880,7 +1912,8 @@ function LaundryApp() {
       overdue,
       owing,
       cashToday,
-      outstanding
+      outstanding,
+      toMessage
     };
   }, [orders]);
   const jumpToOrder = id => {
@@ -2035,7 +2068,7 @@ function LaundryApp() {
     className: "btn-wa",
     target: "_blank",
     rel: "noreferrer",
-    href: waTo(printOrder.phone, printing.type === "slip" ? slipText(printOrder, settings) : receiptText(printOrder, settings))
+    href: waTo(printOrder.phone, printing.type === "slip" ? withTrack(slipText(printOrder, settings), printOrder) : receiptText(printOrder, settings))
   }, React.createElement("span", {
     "aria-hidden": "true"
   }, "📲"), " Send on WhatsApp"), React.createElement("button", {
@@ -2317,7 +2350,13 @@ function LaundryApp() {
     className: "stat-lbl"
   }, "Outstanding"), React.createElement("b", {
     className: "c-red"
-  }, fmt(dash.outstanding)), React.createElement("span", null, "balances owed"))), React.createElement("div", {
+  }, fmt(dash.outstanding)), React.createElement("span", null, "balances owed")), React.createElement("div", {
+    className: "stat"
+  }, React.createElement("span", {
+    className: "stat-lbl"
+  }, "To message"), React.createElement("b", {
+    className: dash.toMessage > 0 ? "c-amber" : "c-green"
+  }, dash.toMessage), React.createElement("span", null, "WhatsApps in the lists below"))), React.createElement("div", {
     className: "panel"
   }, React.createElement("div", {
     className: "panel-head"
@@ -2338,13 +2377,14 @@ function LaundryApp() {
     className: "dash-row"
   }, React.createElement("div", null, React.createElement("b", null, o.id), " · ", o.customerName, React.createElement("span", {
     className: "dash-sub"
-  }, "was due ", o.collectDate, " · balance ", fmt(balanceOf(o)))), React.createElement("div", {
+  }, "was due ", o.collectDate, " · balance ", fmt(balanceOf(o)), o.lastReminderTs ? ` · reminded ${dateLabel(o.lastReminderTs)}` : "")), React.createElement("div", {
     className: "dash-acts"
   }, React.createElement("a", {
     className: "wa-mini",
     target: "_blank",
     rel: "noreferrer",
-    href: waTo(o.phone, overdueText(o, settings))
+    href: waTo(o.phone, withTrack(overdueText(o, settings), o)),
+    onClick: () => stampOrder(o.id, "lastReminderTs")
   }, "Send reminder"), React.createElement("button", {
     className: "btn-ghost small",
     onClick: () => jumpToOrder(o.id)
@@ -2361,13 +2401,14 @@ function LaundryApp() {
       className: "dash-row"
     }, React.createElement("div", null, React.createElement("b", null, o.id), " · ", o.customerName, React.createElement("span", {
       className: "dash-sub"
-    }, bal > 0 ? `balance ${fmt(bal)}` : "fully paid", " · collection ", o.collectDate)), React.createElement("div", {
+    }, bal > 0 ? `balance ${fmt(bal)}` : "fully paid", " · collection ", o.collectDate, o.notifiedReadyTs ? " · notified ✓" : "")), React.createElement("div", {
       className: "dash-acts"
     }, React.createElement("a", {
       className: "wa-mini",
       target: "_blank",
       rel: "noreferrer",
-      href: waTo(o.phone, readyText(o, settings))
+      href: waTo(o.phone, withTrack(readyText(o, settings), o)),
+      onClick: () => stampOrder(o.id, "notifiedReadyTs")
     }, "Notify ready"), React.createElement("button", {
       className: "btn-ghost small",
       onClick: () => jumpToOrder(o.id)
@@ -2381,13 +2422,14 @@ function LaundryApp() {
     className: "dash-row"
   }, React.createElement("div", null, React.createElement("b", null, o.id), " · ", o.customerName, React.createElement("span", {
     className: "dash-sub"
-  }, "owing ", fmt(balanceOf(o)), " · collected ", o.collectDate)), React.createElement("div", {
+  }, "owing ", fmt(balanceOf(o)), " · collected ", o.collectDate, o.lastReminderTs ? ` · reminded ${dateLabel(o.lastReminderTs)}` : "")), React.createElement("div", {
     className: "dash-acts"
   }, React.createElement("a", {
     className: "wa-mini",
     target: "_blank",
     rel: "noreferrer",
-    href: waTo(o.phone, owingText(o, settings))
+    href: waTo(o.phone, owingText(o, settings)),
+    onClick: () => stampOrder(o.id, "lastReminderTs")
   }, "Send reminder"), React.createElement("button", {
     className: "btn-ghost small",
     onClick: () => jumpToOrder(o.id)
@@ -2775,8 +2817,9 @@ function LaundryApp() {
       className: "wa-mini",
       target: "_blank",
       rel: "noreferrer",
-      href: waTo(o.phone, readyText(o, settings))
-    }, "📣 Notify ready"), o.status !== DONE_STATUS && React.createElement(React.Fragment, null, React.createElement("button", {
+      href: waTo(o.phone, withTrack(readyText(o, settings), o)),
+      onClick: () => stampOrder(o.id, "notifiedReadyTs")
+    }, "📣 Notify ready", o.notifiedReadyTs ? " ✓" : ""), o.status !== DONE_STATUS && React.createElement(React.Fragment, null, React.createElement("button", {
       className: "btn-ghost small",
       onClick: () => openEdit(o)
     }, React.createElement("span", {
@@ -3002,6 +3045,22 @@ function LaundryApp() {
   }, "Outstanding"), React.createElement("b", {
     className: "c-red"
   }, fmt(report.outstanding)), React.createElement("span", null, "all-time balances"))), React.createElement("div", {
+    className: "stat-row"
+  }, React.createElement("div", {
+    className: "stat"
+  }, React.createElement("span", {
+    className: "stat-lbl"
+  }, "Turnaround"), React.createElement("b", null, report.avgReadyH == null ? "—" : report.avgReadyH < 48 ? `${Math.round(report.avgReadyH)} h` : `${(report.avgReadyH / 24).toFixed(1)} d`), React.createElement("span", null, "received → ready, average")), React.createElement("div", {
+    className: "stat"
+  }, React.createElement("span", {
+    className: "stat-lbl"
+  }, "Collected on time"), React.createElement("b", {
+    className: report.onTimeRate != null && report.onTimeRate < 0.7 ? "c-amber" : "c-green"
+  }, report.onTimeRate == null ? "—" : Math.round(report.onTimeRate * 100) + "%"), React.createElement("span", null, "of ", report.collectedCount, " collected order", report.collectedCount === 1 ? "" : "s")), React.createElement("div", {
+    className: "stat"
+  }, React.createElement("span", {
+    className: "stat-lbl"
+  }, "Repeat customers"), React.createElement("b", null, report.repeatRate == null ? "—" : Math.round(report.repeatRate * 100) + "%"), React.createElement("span", null, "orders from returning customers"))), React.createElement("div", {
     className: "report-grid"
   }, React.createElement("div", {
     className: "panel"

@@ -661,6 +661,19 @@ function LaundryApp() {
     catch (e) { flash("Couldn't copy automatically — select and copy the code shown below."); }
   };
 
+  /* Customer tracking page: link is added to WhatsApp messages once cloud
+     sync is on (the page reads live status from the shop's database). */
+  const trackUrl = (o) => cloudRef.current
+    ? new URL("status.html", window.location.href).href + `?shop=${cloudRef.current.shopId}&order=${encodeURIComponent(o.id)}`
+    : null;
+  const withTrack = (text, o) => {
+    const u = trackUrl(o);
+    return u ? `${text}\n\nTrack your order here: ${u}` : text;
+  };
+  /* Remember when a customer was messaged, so the dashboard queue shows
+     what still needs sending today. */
+  const stampOrder = (orderId, field) => setOrders((os) => os.map((o) => o.id === orderId ? { ...o, [field]: Date.now() } : o));
+
   /* ---------- settings editors ---------- */
   const [newMethod, setNewMethod] = useState("");
   const [newSlot, setNewSlot] = useState("");
@@ -1240,6 +1253,22 @@ function LaundryApp() {
     const outstanding = live.reduce((a, o) => a + balanceOf(o), 0);
     const orderValue = pOrders.reduce((a, o) => a + o.total, 0);
     const discounts = pOrders.reduce((a, o) => a + (o.discount || 0), 0);
+    /* Operational metrics */
+    const readyDurs = [];
+    pOrders.forEach((o) => {
+      const rec = (o.statusHistory || []).find((h) => h.status === "Received");
+      const rdy = (o.statusHistory || []).find((h) => h.status === "Ready for collection");
+      if (rec && rdy && rdy.ts > rec.ts) readyDurs.push(rdy.ts - rec.ts);
+    });
+    const avgReadyH = readyDurs.length ? readyDurs.reduce((a, b) => a + b, 0) / readyDurs.length / 3600000 : null;
+    const collectedOrders = pOrders.filter((o) => o.status === DONE_STATUS);
+    const onTime = collectedOrders.filter((o) => {
+      const col = [...(o.statusHistory || [])].reverse().find((h) => h.status === DONE_STATUS);
+      return col && o.collectDate && localISO(new Date(col.ts)) <= o.collectDate;
+    }).length;
+    const custCounts = {};
+    live.forEach((o) => { custCounts[o.customerId] = (custCounts[o.customerId] || 0) + 1; });
+    const repeat = pOrders.filter((o) => custCounts[o.customerId] > 1).length;
     return {
       count: pOrders.length, revenue, orderValue,
       avg: pOrders.length ? orderValue / pOrders.length : 0,
@@ -1248,6 +1277,10 @@ function LaundryApp() {
       topItems,
       express: pOrders.filter((o) => o.express).length,
       cancelled: orders.filter((o) => o.cancelled && (o.ts || 0) >= start).length,
+      avgReadyH,
+      onTimeRate: collectedOrders.length ? onTime / collectedOrders.length : null,
+      collectedCount: collectedOrders.length,
+      repeatRate: pOrders.length ? repeat / pOrders.length : null,
     };
   }, [orders, period]);
 
@@ -1267,7 +1300,12 @@ function LaundryApp() {
     let cashToday = 0;
     live.forEach((o) => o.payments.forEach((p) => { if ((p.ts || 0) >= st) cashToday += p.amount; }));
     const outstanding = live.reduce((a, o) => a + balanceOf(o), 0);
-    return { receivedToday, ready, dueToday, overdue, owing, cashToday, outstanding };
+    const now = Date.now();
+    const toMessage =
+      ready.filter((o) => !o.notifiedReadyTs).length +
+      overdue.filter((o) => !o.lastReminderTs || now - o.lastReminderTs > 24 * 3600000).length +
+      owing.filter((o) => !o.lastReminderTs || now - o.lastReminderTs > 3 * 24 * 3600000).length;
+    return { receivedToday, ready, dueToday, overdue, owing, cashToday, outstanding, toMessage };
   }, [orders]);
 
   const jumpToOrder = (id) => { setTab("orders"); setFilter("all"); setSearch(id); };
@@ -1375,7 +1413,7 @@ function LaundryApp() {
           <div className="print-actions no-print">
             <button className="btn-main" onClick={() => window.print()}><span aria-hidden="true">🖨️</span> Print</button>
             <a className="btn-wa" target="_blank" rel="noreferrer"
-               href={waTo(printOrder.phone, printing.type === "slip" ? slipText(printOrder, settings) : receiptText(printOrder, settings))}>
+               href={waTo(printOrder.phone, printing.type === "slip" ? withTrack(slipText(printOrder, settings), printOrder) : receiptText(printOrder, settings))}>
               <span aria-hidden="true">📲</span> Send on WhatsApp
             </a>
             <button className="btn-ghost" onClick={() => setPrinting(null)}>Close</button>
@@ -1543,6 +1581,7 @@ function LaundryApp() {
                 <div className="stat"><span className="stat-lbl">Ready</span><b className="c-green">{dash.ready.length}</b><span>waiting for collection</span></div>
                 <div className="stat"><span className="stat-lbl">Due today</span><b>{dash.dueToday.length}</b><span>collections booked</span></div>
                 <div className="stat"><span className="stat-lbl">Outstanding</span><b className="c-red">{fmt(dash.outstanding)}</b><span>balances owed</span></div>
+                <div className="stat"><span className="stat-lbl">To message</span><b className={dash.toMessage > 0 ? "c-amber" : "c-green"}>{dash.toMessage}</b><span>WhatsApps in the lists below</span></div>
               </div>
 
               <div className="panel">
@@ -1562,10 +1601,11 @@ function LaundryApp() {
                     <div key={o.id} className="dash-row">
                       <div>
                         <b>{o.id}</b> · {o.customerName}
-                        <span className="dash-sub">was due {o.collectDate} · balance {fmt(balanceOf(o))}</span>
+                        <span className="dash-sub">was due {o.collectDate} · balance {fmt(balanceOf(o))}{o.lastReminderTs ? ` · reminded ${dateLabel(o.lastReminderTs)}` : ""}</span>
                       </div>
                       <div className="dash-acts">
-                        <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, overdueText(o, settings))}>Send reminder</a>
+                        <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, withTrack(overdueText(o, settings), o))}
+                          onClick={() => stampOrder(o.id, "lastReminderTs")}>Send reminder</a>
                         <button className="btn-ghost small" onClick={() => jumpToOrder(o.id)}>Open</button>
                       </div>
                     </div>
@@ -1582,10 +1622,11 @@ function LaundryApp() {
                       <div key={o.id} className="dash-row">
                         <div>
                           <b>{o.id}</b> · {o.customerName}
-                          <span className="dash-sub">{bal > 0 ? `balance ${fmt(bal)}` : "fully paid"} · collection {o.collectDate}</span>
+                          <span className="dash-sub">{bal > 0 ? `balance ${fmt(bal)}` : "fully paid"} · collection {o.collectDate}{o.notifiedReadyTs ? " · notified ✓" : ""}</span>
                         </div>
                         <div className="dash-acts">
-                          <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, readyText(o, settings))}>Notify ready</a>
+                          <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, withTrack(readyText(o, settings), o))}
+                            onClick={() => stampOrder(o.id, "notifiedReadyTs")}>Notify ready</a>
                           <button className="btn-ghost small" onClick={() => jumpToOrder(o.id)}>Open</button>
                         </div>
                       </div>
@@ -1601,10 +1642,11 @@ function LaundryApp() {
                       <div key={o.id} className="dash-row">
                         <div>
                           <b>{o.id}</b> · {o.customerName}
-                          <span className="dash-sub">owing {fmt(balanceOf(o))} · collected {o.collectDate}</span>
+                          <span className="dash-sub">owing {fmt(balanceOf(o))} · collected {o.collectDate}{o.lastReminderTs ? ` · reminded ${dateLabel(o.lastReminderTs)}` : ""}</span>
                         </div>
                         <div className="dash-acts">
-                          <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, owingText(o, settings))}>Send reminder</a>
+                          <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, owingText(o, settings))}
+                            onClick={() => stampOrder(o.id, "lastReminderTs")}>Send reminder</a>
                           <button className="btn-ghost small" onClick={() => jumpToOrder(o.id)}>Open</button>
                         </div>
                       </div>
@@ -1879,7 +1921,8 @@ function LaundryApp() {
                           <button className="btn-ghost small" onClick={() => setPrinting({ type: "receipt", orderId: o.id })}><span aria-hidden="true">🧾</span> Receipt</button>
                         )}
                         {o.status === "Ready for collection" && (
-                          <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, readyText(o, settings))}>📣 Notify ready</a>
+                          <a className="wa-mini" target="_blank" rel="noreferrer" href={waTo(o.phone, withTrack(readyText(o, settings), o))}
+                            onClick={() => stampOrder(o.id, "notifiedReadyTs")}>📣 Notify ready{o.notifiedReadyTs ? " ✓" : ""}</a>
                         )}
                         {o.status !== DONE_STATUS && (
                           <>
@@ -2019,6 +2062,12 @@ function LaundryApp() {
                 <div className="stat"><span className="stat-lbl">Average order</span><b>{fmt(report.avg)}</b><span>per order value</span></div>
                 <div className="stat"><span className="stat-lbl">Discounts</span><b className="c-amber">{fmt(report.discounts)}</b><span>given in this period</span></div>
                 <div className="stat"><span className="stat-lbl">Outstanding</span><b className="c-red">{fmt(report.outstanding)}</b><span>all-time balances</span></div>
+              </div>
+
+              <div className="stat-row">
+                <div className="stat"><span className="stat-lbl">Turnaround</span><b>{report.avgReadyH == null ? "—" : report.avgReadyH < 48 ? `${Math.round(report.avgReadyH)} h` : `${(report.avgReadyH / 24).toFixed(1)} d`}</b><span>received → ready, average</span></div>
+                <div className="stat"><span className="stat-lbl">Collected on time</span><b className={report.onTimeRate != null && report.onTimeRate < 0.7 ? "c-amber" : "c-green"}>{report.onTimeRate == null ? "—" : Math.round(report.onTimeRate * 100) + "%"}</b><span>of {report.collectedCount} collected order{report.collectedCount === 1 ? "" : "s"}</span></div>
+                <div className="stat"><span className="stat-lbl">Repeat customers</span><b>{report.repeatRate == null ? "—" : Math.round(report.repeatRate * 100) + "%"}</b><span>orders from returning customers</span></div>
               </div>
 
               <div className="report-grid">

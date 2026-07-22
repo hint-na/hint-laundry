@@ -1,11 +1,12 @@
 /* Hint Laundry service worker — precaches the whole app so it opens
    instantly and fully offline. Bump VERSION on every deploy so phones
    pick up the new build. */
-const VERSION = "v3.1.0";
+const VERSION = "v3.2.0";
 const CACHE = "hint-laundry-" + VERSION;
 const ASSETS = [
   "./",
   "./index.html",
+  "./status.html",
   "./app.js",
   "./manifest.webmanifest",
   "./vendor/react.production.min.js",

@@ -1,0 +1,155 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Track your laundry — Hint Laundry &amp; Dry Cleaners</title>
+<meta name="theme-color" content="#2563EB">
+<link rel="icon" href="icons/icon.svg" type="image/svg+xml">
+<style>
+:root { --blue:#2563EB; --blue-dark:#1D4ED8; --ink:#0F172A; --muted:#566478; --bg:#F1F5F9; --line:#E2E8F0; --green:#16A34A; --red:#DC2626; }
+* { box-sizing:border-box; }
+html,body { margin:0; padding:0; }
+body { background:var(--bg); color:var(--ink); font-family:system-ui,-apple-system,'Segoe UI',Roboto,sans-serif; font-size:16px; line-height:1.5; min-height:100vh; display:grid; place-items:start center; padding:24px 16px 60px; }
+.card { background:#fff; border:1px solid var(--line); border-radius:16px; padding:28px 24px; width:min(430px,100%); box-shadow:0 10px 30px rgba(15,23,42,.07); }
+.logo { width:54px; height:54px; border-radius:14px; background:var(--blue); display:grid; place-items:center; font-size:26px; margin:0 auto 10px; }
+h1 { font-size:20px; text-align:center; margin:0 0 2px; }
+.sub { text-align:center; color:var(--muted); font-size:14px; margin:0 0 20px; }
+label { display:block; font-size:13px; font-weight:600; color:var(--muted); margin-bottom:6px; }
+.row { display:flex; gap:8px; }
+input { flex:1; font:inherit; padding:12px 14px; border:1px solid #CBD5E1; border-radius:10px; min-width:0; text-transform:uppercase; }
+input:focus { outline:none; border-color:var(--blue); box-shadow:0 0 0 3px rgba(37,99,235,.15); }
+button { font:inherit; font-weight:700; background:var(--blue); color:#fff; border:0; border-radius:10px; padding:12px 20px; cursor:pointer; }
+button:hover { background:var(--blue-dark); }
+button:disabled { opacity:.5; cursor:default; }
+.result { margin-top:22px; }
+.status-big { text-align:center; font-size:18px; font-weight:800; margin:4px 0 16px; }
+.steps { display:flex; margin:14px 0 6px; }
+.step { flex:1; text-align:center; position:relative; padding-top:16px; font-size:10.5px; color:var(--muted); }
+.step::before { content:""; position:absolute; top:4px; left:50%; transform:translateX(-50%); width:12px; height:12px; border-radius:99px; background:#fff; border:3px solid #CBD5E1; z-index:1; }
+.step:not(:last-child)::after { content:""; position:absolute; top:9px; left:50%; width:100%; height:3px; background:var(--line); }
+.step.done::before { background:var(--blue); border-color:var(--blue); }
+.step.done::after { background:var(--blue); }
+.step.now { color:var(--ink); font-weight:700; }
+.step.now::before { border-color:var(--blue); box-shadow:0 0 0 4px rgba(37,99,235,.2); }
+.facts { margin-top:16px; border-top:1.5px dashed var(--line); padding-top:12px; display:grid; gap:6px; font-size:14.5px; }
+.facts div { display:flex; justify-content:space-between; gap:12px; }
+.facts span { color:var(--muted); }
+.balance-due { color:var(--red); font-weight:700; }
+.paid { color:var(--green); font-weight:700; }
+.note { margin-top:16px; font-size:13px; color:var(--muted); text-align:center; }
+.err { margin-top:18px; background:#FEF2F2; border:1px solid #FECACA; color:#B91C1C; border-radius:10px; padding:12px 14px; font-size:14px; }
+.hidden { display:none; }
+.foot { text-align:center; margin-top:20px; font-size:12.5px; color:var(--muted); }
+</style>
+</head>
+<body>
+<main class="card">
+  <div class="logo" aria-hidden="true">💧</div>
+  <h1 id="shop-name">Track your laundry</h1>
+  <p class="sub" id="shop-sub">Enter the order number from your slip</p>
+
+  <form id="form">
+    <label for="order">Order number</label>
+    <div class="row">
+      <input id="order" placeholder="HL-1043" autocomplete="off" inputmode="text" required>
+      <button id="go" type="submit">Check</button>
+    </div>
+  </form>
+
+  <div id="result" class="result hidden" aria-live="polite">
+    <div class="status-big" id="status-line"></div>
+    <div class="steps" id="steps"></div>
+    <div class="facts" id="facts"></div>
+    <p class="note" id="note"></p>
+  </div>
+  <div id="error" class="err hidden" role="alert"></div>
+  <p class="foot" id="foot"></p>
+</main>
+<script>
+(function () {
+  var RPC = "https://nktxqlzhqaossvopicne.supabase.co/rest/v1/rpc/laundry_order_status";
+  var KEY = "sb_publishable_xCdMgYNtcivjSRbQwqw-kA_d7ihfcNn";
+  var STAGES = ["Received", "Cleaning", "Ready for collection", "Collected"];
+  var qs = new URLSearchParams(location.search);
+  var shop = qs.get("shop");
+  var orderInput = document.getElementById("order");
+  var form = document.getElementById("form");
+  var el = function (id) { return document.getElementById(id); };
+
+  if (!shop) {
+    el("error").textContent = "This link is missing its shop code. Please use the tracking link from your WhatsApp slip.";
+    el("error").classList.remove("hidden");
+    form.classList.add("hidden");
+  }
+  if (qs.get("order")) orderInput.value = qs.get("order");
+
+  function fmtN(n) { return "N$" + Number(n).toFixed(2).replace(/\.00$/, ""); }
+
+  function render(d) {
+    el("result").classList.add("hidden");
+    el("error").classList.add("hidden");
+    if (d.shopName) {
+      el("shop-name").textContent = d.shopName;
+      el("shop-sub").textContent = "Track your laundry order";
+      el("foot").textContent = d.hours ? "Open " + d.hours + (d.shopPhone ? " · " + d.shopPhone : "") : "";
+    }
+    if (!d.found) {
+      el("error").textContent = "We couldn't find that order number. Check the slip and type it exactly, e.g. HL-1043.";
+      el("error").classList.remove("hidden");
+      return;
+    }
+    var idx = STAGES.indexOf(d.status);
+    var cancelled = d.status === "Cancelled";
+    el("status-line").textContent = cancelled ? d.order + " was cancelled"
+      : d.status === "Collected" ? d.order + " has been collected. Thank you!"
+      : d.status === "Ready for collection" ? d.order + " is ready for collection! 🎉"
+      : d.order + " — " + (d.status === "Cleaning" ? "being cleaned" : "received, cleaning starts soon");
+    var stepsHtml = "";
+    if (!cancelled) {
+      for (var i = 0; i < STAGES.length; i++) {
+        stepsHtml += '<div class="step ' + (i < idx ? "done" : i === idx ? "done now" : "") + '">' + STAGES[i] + "</div>";
+      }
+    }
+    el("steps").innerHTML = stepsHtml;
+    var facts = "";
+    if (!cancelled && d.status !== "Collected" && d.collectDate) {
+      facts += "<div><span>Collection</span><b>" + d.collectDate + (d.collectSlot ? " · " + d.collectSlot : "") + "</b></div>";
+    }
+    if (!cancelled) {
+      facts += "<div><span>Balance</span><b class=\"" + (d.balance > 0 ? "balance-due" : "paid") + "\">" +
+        (d.balance > 0 ? fmtN(d.balance) + " due" : "Fully paid") + "</b></div>";
+    }
+    if (d.express) facts += "<div><span>Service</span><b>Express (24h)</b></div>";
+    el("facts").innerHTML = facts;
+    el("note").textContent = cancelled ? "Please contact the shop if this is unexpected."
+      : d.balance > 0 && d.status !== "Collected" ? "Please bring your slip. The balance is payable on collection."
+      : d.status !== "Collected" ? "Please bring your slip or quote your order number."
+      : "";
+    el("result").classList.remove("hidden");
+  }
+
+  function lookup() {
+    var order = orderInput.value.trim();
+    if (!order || !shop) return;
+    el("go").disabled = true;
+    el("error").classList.add("hidden");
+    fetch(RPC, {
+      method: "POST",
+      headers: { "Content-Type": "application/json", apikey: KEY, Authorization: "Bearer " + KEY },
+      body: JSON.stringify({ p_shop: shop, p_order: order })
+    }).then(function (r) {
+      if (!r.ok) throw new Error("http " + r.status);
+      return r.json();
+    }).then(render).catch(function () {
+      el("error").textContent = "Couldn't check right now — please try again in a moment.";
+      el("error").classList.remove("hidden");
+    }).finally(function () { el("go").disabled = false; });
+  }
+
+  form.addEventListener("submit", function (e) { e.preventDefault(); lookup(); });
+  if (shop && qs.get("order")) lookup();
+})();
+</script>
+</body>
+</html>
