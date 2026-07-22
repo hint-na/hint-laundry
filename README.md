@@ -29,5 +29,17 @@ even with no internet.
 3. Bump `VERSION` in `sw.js` (e.g. `v3.0.0` → `v3.0.1`) so phones fetch the new build.
 4. Commit and push — GitHub Pages redeploys automatically.
 
-Data is stored on each device (localStorage) with daily backup downloads for
-the owner. Moving to a shared cloud database is planned as Phase 2.
+## Data & cloud sync
+
+Each device works from its own local store (localStorage) with daily backup
+downloads for the owner, so the app is fully usable offline. Optionally, the
+owner can turn on **cloud sync** in Settings: records are then also stored in
+the shop's Supabase database (project `hint-laundry`) and every connected
+device sees the same customers, orders and payments. Devices join by pasting
+the shop's link code (Settings → Copy link code). Sync is last-write-wins per
+record, works offline-first, and catches up automatically when internet
+returns. Staff PINs are stored as salted SHA-256 hashes.
+
+The Supabase side is two SQL functions (`laundry_create_shop`,
+`laundry_sync`) with row-level security locked down — the publishable key in
+`app.jsx` grants no data access without a shop's secret link code.

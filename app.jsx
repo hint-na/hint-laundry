@@ -129,7 +129,7 @@ const seedCustomers = [
 
 const seedOrders = [
   {
-    id: "HL-1041", customerId: "C-1001", customerName: "Ndapewa Amutenya", phone: "+264 81 555 0192",
+    uid: "seed-1041", id: "HL-1041", customerId: "C-1001", customerName: "Ndapewa Amutenya", phone: "+264 81 555 0192",
     items: [
       { key: "s1", name: "Long sleeve shirt", qty: 3, price: 25 },
       { key: "s2", name: "Trouser / Skirt", qty: 2, price: 30 },
@@ -147,7 +147,7 @@ const seedOrders = [
     ts: T("2026-07-03T09:20"),
   },
   {
-    id: "HL-1042", customerId: "C-1001", customerName: "Ndapewa Amutenya", phone: "+264 81 555 0192",
+    uid: "seed-1042", id: "HL-1042", customerId: "C-1001", customerName: "Ndapewa Amutenya", phone: "+264 81 555 0192",
     items: [
       { key: "s3", name: "Complete suit", qty: 1, price: 80 },
       { key: "s4", name: "Dress", qty: 1, price: 45 },
@@ -166,6 +166,34 @@ const seedOrders = [
 
 let orderSeq = 1043;
 const STORAGE_KEY = "hint-laundry-v2";
+
+/* ---------- cloud sync (Supabase, opt-in from Settings) ---------- */
+/* The publishable key is safe to ship — data access is guarded server-side
+   by each shop's secret link code. */
+const CLOUD_URL = "https://nktxqlzhqaossvopicne.supabase.co/rest/v1/rpc";
+const CLOUD_KEY = "sb_publishable_xCdMgYNtcivjSRbQwqw-kA_d7ihfcNn";
+const CLOUD_STORE_KEY = "hint-laundry-cloud";
+const META_STORE_KEY = "hint-laundry-sync-meta";
+const cloudCall = async (fn, args) => {
+  const res = await fetch(`${CLOUD_URL}/${fn}`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json", apikey: CLOUD_KEY, Authorization: `Bearer ${CLOUD_KEY}` },
+    body: JSON.stringify(args),
+  });
+  if (!res.ok) throw new Error(`sync-http-${res.status}`);
+  return res.json();
+};
+
+/* PINs are stored as salted SHA-256 hashes, never as plain text. */
+const hashPin = async (pin, salt) => {
+  const bytes = new TextEncoder().encode(`hint-laundry|${salt}|${pin}`);
+  const buf = await crypto.subtle.digest("SHA-256", bytes);
+  return Array.from(new Uint8Array(buf)).map((b) => b.toString(16).padStart(2, "0")).join("");
+};
+const pinMatches = async (pin, user) => {
+  if (user.pinHash) return (await hashPin(pin, user.id)) === user.pinHash;
+  return user.pin === pin; // not-yet-migrated record
+};
 
 /* ---------- money helpers ---------- */
 const paidOf = (o) => o.payments.reduce((a, p) => a + p.amount, 0);
@@ -238,18 +266,206 @@ function LaundryApp() {
   const [cancelDraft, setCancelDraft] = useState(null); // { orderId, reason }
   const restoreInput = useRef(null);
 
+  /* ---------- cloud sync state ---------- */
+  const [cloud, setCloud] = useState(null);           // { shopId, secret, cursor, lastSyncTs }
+  const [syncState, setSyncState] = useState("idle"); // idle | syncing | offline | error
+  const cloudRef = useRef(null);
+  const metaRef = useRef({});       // "kind:id" -> updated_at of the version we hold
+  const snapshotRef = useRef({});   // "kind:id" -> JSON of the last seen/synced version
+  const dirtyRef = useRef(new Set());
+  const deletedRef = useRef({});    // tombstones awaiting push
+  const stateRef = useRef({});
+  stateRef.current = { customers, orders, services, users, settings };
+  const syncBusy = useRef(false);
+  const syncTimer = useRef(null);
+
+  const setCloudPersist = (cl) => {
+    cloudRef.current = cl;
+    setCloud(cl);
+    try {
+      if (cl) localStorage.setItem(CLOUD_STORE_KEY, JSON.stringify(cl));
+      else localStorage.removeItem(CLOUD_STORE_KEY);
+    } catch (e) {}
+  };
+  const saveMeta = () => {
+    try {
+      localStorage.setItem(META_STORE_KEY, JSON.stringify({
+        meta: metaRef.current,
+        dirty: [...dirtyRef.current],
+        deleted: deletedRef.current,
+      }));
+    } catch (e) {}
+  };
+
+  const recordKey = (kind, r) => kind + ":" + (kind === "orders" ? (r.uid || r.id) : r.id);
+  const findRecord = (kind, id) => {
+    const st = stateRef.current;
+    if (kind === "settings") return st.settings;
+    if (kind === "orders") return st.orders.find((o) => (o.uid || o.id) === id) || null;
+    return (st[kind] || []).find((r) => r.id === id) || null;
+  };
+
+  /* Stamp anything that changed since the last snapshot, so it gets pushed. */
+  const diffAndStamp = () => {
+    const st = stateRef.current;
+    const lists = { customers: st.customers, orders: st.orders, services: st.services, users: st.users };
+    const seen = new Set(["settings:settings"]);
+    let changed = false;
+    const stamp = (key, json) => {
+      snapshotRef.current[key] = json;
+      metaRef.current[key] = Date.now();
+      dirtyRef.current.add(key);
+      changed = true;
+    };
+    Object.entries(lists).forEach(([kind, arr]) => {
+      (arr || []).forEach((r) => {
+        const key = recordKey(kind, r);
+        seen.add(key);
+        const json = JSON.stringify(r);
+        if (snapshotRef.current[key] !== json) stamp(key, json);
+      });
+    });
+    const sj = JSON.stringify(st.settings);
+    if (snapshotRef.current["settings:settings"] !== sj) stamp("settings:settings", sj);
+    Object.keys(snapshotRef.current).forEach((key) => {
+      if (!seen.has(key)) {
+        delete snapshotRef.current[key];
+        metaRef.current[key] = Date.now();
+        deletedRef.current[key] = true;
+        dirtyRef.current.add(key);
+        changed = true;
+      }
+    });
+    if (changed) {
+      saveMeta();
+      if (cloudRef.current) {
+        clearTimeout(syncTimer.current);
+        syncTimer.current = setTimeout(() => doSync(), 2500);
+      }
+    }
+  };
+
+  /* After pulling, give duplicate order numbers (two devices offline at once)
+     a letter suffix so every slip number stays unique. */
+  const resolveDisplayIds = (os) => {
+    const byId = {};
+    const sorted = [...os].sort((a, b) => (a.ts || 0) - (b.ts || 0));
+    sorted.forEach((o) => {
+      if (!byId[o.id]) { byId[o.id] = o; return; }
+      let suffix = "B", next = o.id + suffix;
+      while (byId[next]) { suffix = String.fromCharCode(suffix.charCodeAt(0) + 1); next = o.id + suffix; }
+      o.id = next;
+      byId[next] = o;
+      const key = recordKey("orders", o);
+      metaRef.current[key] = Date.now();
+      snapshotRef.current[key] = JSON.stringify(o);
+      dirtyRef.current.add(key);
+    });
+    return os;
+  };
+
+  const applyPulled = (rows) => {
+    if (!rows || rows.length === 0) return;
+    const byKind = {};
+    rows.forEach((r) => {
+      const key = r.kind + ":" + r.id;
+      if ((r.updated_at || 0) <= (metaRef.current[key] || 0)) return; // ours is same or newer
+      (byKind[r.kind] = byKind[r.kind] || []).push(r);
+      metaRef.current[key] = r.updated_at;
+      if (r.deleted) delete snapshotRef.current[key];
+      else snapshotRef.current[key] = JSON.stringify(r.data);
+      dirtyRef.current.delete(key);
+      delete deletedRef.current[key];
+    });
+    const mergeList = (current, pulls, keyOf) => {
+      const map = new Map(current.map((r) => [keyOf(r), r]));
+      pulls.forEach((p) => { if (p.deleted) map.delete(p.id); else map.set(p.id, p.data); });
+      return [...map.values()];
+    };
+    if (byKind.customers) setCustomers((cs) => mergeList(cs, byKind.customers, (r) => r.id));
+    if (byKind.services) setServices((sv) => mergeList(sv, byKind.services, (r) => r.id));
+    if (byKind.users) setUsers((us) => {
+      const merged = mergeList(us, byKind.users, (r) => r.id);
+      return merged.length > 0 ? merged : us;
+    });
+    if (byKind.orders) setOrders((os) => {
+      const merged = resolveDisplayIds(mergeList(os, byKind.orders, (r) => r.uid || r.id));
+      merged.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+      const maxN = merged.reduce((m, o) => {
+        const n = parseInt(String(o.id).replace(/\D/g, ""), 10);
+        return isNaN(n) ? m : Math.max(m, n);
+      }, orderSeq - 1);
+      orderSeq = maxN + 1;
+      return merged;
+    });
+    if (byKind.settings) {
+      const last = byKind.settings[byKind.settings.length - 1];
+      setSettings({ ...DEFAULT_SETTINGS, ...last.data });
+    }
+    saveMeta();
+  };
+
+  const doSync = async () => {
+    const cl = cloudRef.current;
+    if (!cl || syncBusy.current) return;
+    syncBusy.current = true;
+    setSyncState("syncing");
+    try {
+      const dirtyKeys = [...dirtyRef.current];
+      const changes = dirtyKeys.map((key) => {
+        const i = key.indexOf(":");
+        const kind = key.slice(0, i), id = key.slice(i + 1);
+        if (deletedRef.current[key]) return { kind, id, data: {}, updated_at: metaRef.current[key] || Date.now(), deleted: true };
+        const obj = findRecord(kind, id);
+        return obj ? { kind, id, data: obj, updated_at: metaRef.current[key] || Date.now() } : null;
+      }).filter(Boolean);
+      const out = await cloudCall("laundry_sync", {
+        p_shop: cl.shopId, p_secret: cl.secret, p_since: cl.cursor || 0, p_changes: changes,
+      });
+      applyPulled(out.rows || []);
+      dirtyKeys.forEach((k) => { dirtyRef.current.delete(k); delete deletedRef.current[k]; });
+      saveMeta();
+      setCloudPersist({ ...cl, cursor: out.seq || cl.cursor || 0, lastSyncTs: Date.now() });
+      setSyncState("idle");
+    } catch (e) {
+      setSyncState(!navigator.onLine || String(e.message || e).includes("fetch") ? "offline" : "error");
+    } finally {
+      syncBusy.current = false;
+    }
+  };
+
+  /* Background sync: on load, on reconnect, and every 45 seconds. */
+  useEffect(() => {
+    if (!loaded || !cloud) return;
+    const kick = () => doSync();
+    window.addEventListener("online", kick);
+    document.addEventListener("visibilitychange", kick);
+    const iv = setInterval(kick, 45000);
+    kick();
+    return () => { window.removeEventListener("online", kick); document.removeEventListener("visibilitychange", kick); clearInterval(iv); };
+  }, [loaded, cloud ? cloud.shopId : null]);
+
   /* ---------- persistence ---------- */
   useEffect(() => {
     (async () => {
+      /* Baseline for change detection: what this device held at startup.
+         Unpushed edits from earlier sessions live on in the saved dirty list. */
+      let base = { customers: seedCustomers, orders: seedOrders, services: DEFAULT_SERVICES, users: DEFAULT_USERS, settings: DEFAULT_SETTINGS };
       try {
         const res = await appStorage.get(STORAGE_KEY);
         if (res?.value) {
           const s = JSON.parse(res.value);
-          if (Array.isArray(s.customers)) setCustomers(s.customers);
-          if (Array.isArray(s.orders)) setOrders(s.orders);
-          if (Array.isArray(s.services)) setServices(s.services);
-          if (Array.isArray(s.users) && s.users.length > 0) setUsers(s.users);
-          if (s.settings && typeof s.settings === "object") setSettings({ ...DEFAULT_SETTINGS, ...s.settings });
+          if (Array.isArray(s.customers)) { setCustomers(s.customers); base.customers = s.customers; }
+          if (Array.isArray(s.orders)) {
+            const withUids = s.orders.map((o) => o.uid ? o : { ...o, uid: "legacy-" + o.id });
+            setOrders(withUids); base.orders = withUids;
+          }
+          if (Array.isArray(s.services)) { setServices(s.services); base.services = s.services; }
+          if (Array.isArray(s.users) && s.users.length > 0) { setUsers(s.users); base.users = s.users; }
+          if (s.settings && typeof s.settings === "object") {
+            const st = { ...DEFAULT_SETTINGS, ...s.settings };
+            setSettings(st); base.settings = st;
+          }
           if (s.lastBackupTs) setLastBackupTs(s.lastBackupTs);
           const maxOrder = (s.orders || []).reduce((m, o) => {
             const n = parseInt(String(o.id).replace(/\D/g, ""), 10);
@@ -258,6 +474,22 @@ function LaundryApp() {
           orderSeq = maxOrder + 1;
         }
       } catch (e) { /* first run — demo seed */ }
+      ["customers", "orders", "services", "users"].forEach((kind) => {
+        base[kind].forEach((r) => { snapshotRef.current[recordKey(kind, r)] = JSON.stringify(r); });
+      });
+      snapshotRef.current["settings:settings"] = JSON.stringify(base.settings);
+      try {
+        const cl = JSON.parse(localStorage.getItem(CLOUD_STORE_KEY));
+        if (cl && cl.shopId && cl.secret) { cloudRef.current = cl; setCloud(cl); }
+      } catch (e) {}
+      try {
+        const m = JSON.parse(localStorage.getItem(META_STORE_KEY));
+        if (m && m.meta) {
+          metaRef.current = m.meta;
+          dirtyRef.current = new Set(m.dirty || []);
+          deletedRef.current = m.deleted || {};
+        }
+      } catch (e) {}
       setLoaded(true);
     })();
   }, []);
@@ -268,6 +500,7 @@ function LaundryApp() {
       try {
         await appStorage.set(STORAGE_KEY, JSON.stringify({ customers, orders, services, users, settings, lastBackupTs }));
       } catch (e) { console.error("Save failed:", e); }
+      diffAndStamp();
     }, 400);
     return () => clearTimeout(t);
   }, [loaded, customers, orders, services, users, settings, lastBackupTs]);
@@ -285,7 +518,7 @@ function LaundryApp() {
   };
   const resetAllData = () => askConfirm({
     title: "Reset all data?",
-    body: `This permanently deletes every order (${orders.length}), customer (${customers.length}), payment and setting on this device and restores the demo data. This cannot be undone.`,
+    body: `This permanently deletes every order (${orders.length}), customer (${customers.length}), payment and setting${cloudRef.current ? " — including the shop's cloud copy shared with other devices" : " on this device"} — and restores the demo data. This cannot be undone.`,
     requireText: "RESET",
     confirmLabel: "Delete everything",
     danger: true,
@@ -336,6 +569,96 @@ function LaundryApp() {
       }
     };
     reader.readAsText(file);
+  };
+
+  /* ---------- cloud sync actions ---------- */
+  const [joinCode, setJoinCode] = useState("");
+  const markAllDirty = () => {
+    const st = stateRef.current;
+    ["customers", "orders", "services", "users"].forEach((kind) => {
+      (st[kind] || []).forEach((r) => {
+        const key = recordKey(kind, r);
+        snapshotRef.current[key] = JSON.stringify(r);
+        metaRef.current[key] = Date.now();
+        dirtyRef.current.add(key);
+      });
+    });
+    snapshotRef.current["settings:settings"] = JSON.stringify(st.settings);
+    metaRef.current["settings:settings"] = Date.now();
+    dirtyRef.current.add("settings:settings");
+    saveMeta();
+  };
+  const enableCloud = async () => {
+    try {
+      setSyncState("syncing");
+      const out = await cloudCall("laundry_create_shop", { p_name: settings.shopName });
+      setCloudPersist({ shopId: out.shop_id, secret: out.secret, cursor: 0, lastSyncTs: 0 });
+      markAllDirty();
+      flash("Cloud sync is on — this device's records are being uploaded now.");
+      setTimeout(() => doSync(), 100);
+    } catch (e) {
+      setSyncState("error");
+      flash("Couldn't reach the sync server — check the internet connection and try again.");
+    }
+  };
+  const joinCloud = () => {
+    const m = joinCode.trim().match(/^([0-9a-f-]{36})\.([0-9a-f-]{36})$/i);
+    if (!m) { flash("That doesn't look like a link code — copy it exactly from the other device's Settings."); return; }
+    askConfirm({
+      title: "Connect to the shop's cloud records?",
+      body: "This device will join the shared shop. Whatever is on this device now (demo or old records) will be replaced by the shop's cloud data, and you'll sign in again with your shop PIN.",
+      confirmLabel: "Connect",
+      onConfirm: async () => {
+        try {
+          setSyncState("syncing");
+          const out = await cloudCall("laundry_sync", { p_shop: m[1], p_secret: m[2], p_since: 0, p_changes: [] });
+          const rows = out.rows || [];
+          const pick = (kind, fallback) => {
+            const rs = rows.filter((r) => r.kind === kind && !r.deleted);
+            return rs.length ? rs.map((r) => r.data) : fallback;
+          };
+          metaRef.current = {}; snapshotRef.current = {}; dirtyRef.current = new Set(); deletedRef.current = {};
+          rows.forEach((r) => {
+            const key = r.kind + ":" + r.id;
+            metaRef.current[key] = r.updated_at;
+            if (!r.deleted) snapshotRef.current[key] = JSON.stringify(r.data);
+          });
+          const newOrders = pick("orders", []);
+          newOrders.sort((a, b) => (b.ts || 0) - (a.ts || 0));
+          setCustomers(pick("customers", []));
+          setOrders(newOrders);
+          setServices(pick("services", DEFAULT_SERVICES));
+          setUsers(pick("users", DEFAULT_USERS));
+          const sRow = rows.filter((r) => r.kind === "settings" && !r.deleted).pop();
+          setSettings(sRow ? { ...DEFAULT_SETTINGS, ...sRow.data } : DEFAULT_SETTINGS);
+          orderSeq = newOrders.reduce((mx, o) => {
+            const n = parseInt(String(o.id).replace(/\D/g, ""), 10);
+            return isNaN(n) ? mx : Math.max(mx, n);
+          }, 1042) + 1;
+          saveMeta();
+          setCloudPersist({ shopId: m[1], secret: m[2], cursor: out.seq || 0, lastSyncTs: Date.now() });
+          setJoinCode("");
+          setSyncState("idle");
+          setUnlocked(false); setCurrentStaff(""); setCurrentUserId(null);
+          flash("Connected — sign in with your shop PIN.");
+        } catch (e) {
+          setSyncState("error");
+          flash(String(e.message || "").includes("sync-http-4") ? "That link code was not accepted — check it and try again." : "Couldn't reach the sync server — check the internet connection and try again.");
+        }
+      },
+    });
+  };
+  const disconnectCloud = () => askConfirm({
+    title: "Disconnect from cloud sync?",
+    body: "This device keeps everything it has now, but stops sharing with the other devices. You can reconnect anytime with the link code.",
+    confirmLabel: "Disconnect",
+    danger: true,
+    onConfirm: () => { setCloudPersist(null); setSyncState("idle"); flash("Cloud sync is off for this device."); },
+  });
+  const linkCode = cloud ? `${cloud.shopId}.${cloud.secret}` : "";
+  const copyLinkCode = async () => {
+    try { await navigator.clipboard.writeText(linkCode); flash("Link code copied — paste it in Settings on the other device."); }
+    catch (e) { flash("Couldn't copy automatically — select and copy the code shown below."); }
   };
 
   /* ---------- settings editors ---------- */
@@ -469,13 +792,15 @@ function LaundryApp() {
 
   /* ---------- team (users) management ---------- */
   const [userDraft, setUserDraft] = useState({ name: "", pin: "", role: "staff" });
-  const addUser = () => {
+  const addUser = async () => {
     const name = userDraft.name.trim();
     const pin = userDraft.pin.trim();
     if (!name) { flash("Give the person a name."); return; }
     if (!/^\d{4,6}$/.test(pin)) { flash("PIN must be 4–6 digits."); return; }
-    if (users.some((u) => u.pin === pin)) { flash("That PIN is already taken — pick a different one."); return; }
-    setUsers((us) => [...us, { id: newKey(), name, pin, role: userDraft.role }]);
+    if (await pinTaken(pin, null)) { flash("That PIN is already taken — pick a different one."); return; }
+    const id = newKey();
+    const pinHash = await hashPin(pin, id);
+    setUsers((us) => [...us, { id, name, pinHash, role: userDraft.role }]);
     setUserDraft({ name: "", pin: "", role: "staff" });
     flash(`${name} added — they sign in with their own PIN.`);
   };
@@ -498,21 +823,48 @@ function LaundryApp() {
     });
   };
   /* Edit a person's name or PIN in place (no more remove-and-re-add). */
-  const [userEdit, setUserEdit] = useState(null); // { id, name, pin }
-  const [showPins, setShowPins] = useState(false);
-  const saveUserEdit = () => {
+  const [userEdit, setUserEdit] = useState(null); // { id, name, pin }  (pin blank = keep current)
+  const pinTaken = async (pin, exceptId) => {
+    for (const u of users) {
+      if (u.id !== exceptId && await pinMatches(pin, u)) return true;
+    }
+    return false;
+  };
+  const saveUserEdit = async () => {
     if (!userEdit) return;
     const name = userEdit.name.trim();
     const pin = userEdit.pin.trim();
     if (!name) { flash("Give the person a name."); return; }
-    if (!/^\d{4,6}$/.test(pin)) { flash("PIN must be 4–6 digits."); return; }
-    if (users.some((u) => u.pin === pin && u.id !== userEdit.id)) { flash("That PIN is already taken — pick a different one."); return; }
-    setUsers((us) => us.map((u) => u.id === userEdit.id ? { ...u, name, pin } : u));
+    if (pin && !/^\d{4,6}$/.test(pin)) { flash("PIN must be 4–6 digits."); return; }
+    if (pin && await pinTaken(pin, userEdit.id)) { flash("That PIN is already taken — pick a different one."); return; }
+    const pinHash = pin ? await hashPin(pin, userEdit.id) : null;
+    setUsers((us) => us.map((u) => u.id === userEdit.id
+      ? (pinHash ? { ...u, name, pinHash, pin: undefined } : { ...u, name })
+      : u));
     if (userEdit.id === currentUserId) setCurrentStaff(name);
     setUserEdit(null);
-    flash(`Saved — ${name} signs in with the new PIN from now on.`);
+    flash(pin ? `Saved — ${name} signs in with the new PIN from now on.` : "Saved.");
   };
-  const defaultPinsActive = users.some((u) => u.pin === ADMIN_PIN || u.pin === STAFF_PIN);
+
+  /* PINs are hashed at rest. Old plain-text records are converted on load,
+     and the demo-PIN warning works by checking the known hashes. */
+  const [defaultPinsActive, setDefaultPinsActive] = useState(false);
+  useEffect(() => {
+    if (!loaded) return;
+    (async () => {
+      if (users.some((u) => u.pin && !u.pinHash)) {
+        const converted = await Promise.all(users.map(async (u) => {
+          if (!u.pin || u.pinHash) return u;
+          const { pin, ...rest } = u;
+          return { ...rest, pinHash: await hashPin(pin, u.id) };
+        }));
+        setUsers(converted);
+        return; // effect re-runs with converted users for the check below
+      }
+      const flags = await Promise.all(users.map(async (u) => (await pinMatches(ADMIN_PIN, u)) || (await pinMatches(STAFF_PIN, u))));
+      setDefaultPinsActive(flags.some(Boolean));
+    })();
+  }, [loaded, users]);
 
   /* ---------- new order ---------- */
   const [sel, setSel] = useState({ customerId: "", name: "", phone: "", address: "", newMode: false });
@@ -638,6 +990,7 @@ function LaundryApp() {
     const amt = parseFloat(payNow.amount);
     if (amt > 0) payments.push({ amount: amt, method: payNow.method, ts: now, by: currentStaff });
     const order = {
+      uid: newKey(),
       id, customerId: cust.id, customerName: cust.name, phone: cust.phone,
       items: cartLines.map((l) => ({ key: l.key, name: l.name, qty: l.qty, price: l.price })),
       express, discount: discountVal, collectDate: collect.date, collectSlot: collect.slot, notes: notes.trim(),
@@ -845,6 +1198,8 @@ function LaundryApp() {
   /* ---------- order list filters ---------- */
   const [search, setSearch] = useState("");
   const [filter, setFilter] = useState("open");
+  const [showCount, setShowCount] = useState(50);
+  useEffect(() => { setShowCount(50); }, [filter, search]);
   const visibleOrders = orders.filter((o) => {
     if (filter === "open" && (o.status === DONE_STATUS || o.cancelled)) return false;
     if (filter === "unpaid" && (payState(o) === "paid" || o.cancelled)) return false;
@@ -962,8 +1317,11 @@ function LaundryApp() {
 
   /* ---------- login ---------- */
   if (!unlocked) {
-    const tryUnlock = () => {
-      const user = users.find((u) => u.pin === pinInput);
+    const tryUnlock = async () => {
+      let user = null;
+      for (const u of users) {
+        if (await pinMatches(pinInput, u)) { user = u; break; }
+      }
       if (!user) { setPinError("PIN not recognised — try again."); setPinInput(""); return; }
       setRole(user.role);
       setCurrentStaff(user.name);
@@ -1137,6 +1495,14 @@ function LaundryApp() {
             {isAdmin && <button className={tab === "settings" ? "on" : ""} aria-current={tab === "settings" ? "page" : undefined} onClick={() => setTab("settings")}><i aria-hidden="true">⚙️</i> Settings</button>}
           </nav>
           <div className="sb-foot">
+            {cloud && (
+              <div className={"sync-chip sync-" + syncState} role="status">
+                {syncState === "syncing" ? "☁ Syncing…"
+                  : syncState === "offline" ? "☁ Offline — will catch up"
+                  : syncState === "error" ? "☁ Sync problem — retrying"
+                  : "☁ Synced"}
+              </div>
+            )}
             <div className="sb-user">
               <span className="sb-avatar">{currentStaff.slice(0, 1).toUpperCase()}</span>
               <div><b>{currentStaff}</b><span>{isAdmin ? "Owner" : "Staff"}</span></div>
@@ -1457,7 +1823,7 @@ function LaundryApp() {
               </div>
 
               {visibleOrders.length === 0 && <div className="panel"><p className="muted">No orders match.</p></div>}
-              {visibleOrders.map((o) => {
+              {visibleOrders.slice(0, showCount).map((o) => {
                 const ps = payState(o);
                 const draft = payDraft[o.id] || { amount: "", method: settings.payMethods[0] };
                 const idx = STATUSES.indexOf(o.status);
@@ -1571,6 +1937,11 @@ function LaundryApp() {
                   </div>
                 );
               })}
+              {visibleOrders.length > showCount && (
+                <button className="btn-ghost show-more" onClick={() => setShowCount((c) => c + 50)}>
+                  Show 50 more ({visibleOrders.length - showCount} remaining)
+                </button>
+              )}
             </section>
           )}
 
@@ -1772,9 +2143,6 @@ function LaundryApp() {
               {defaultPinsActive && (
                 <div className="warn-banner">⚠️ The demo PINs (1234 / 5678) are still active. Use ✏️ Edit to give each person their own secret PIN before staff start using the app.</div>
               )}
-              <div className="edit-add">
-                <button className="btn-ghost small" onClick={() => setShowPins((s) => !s)}>{showPins ? "🙈 Hide PINs" : "👁 Show PINs"}</button>
-              </div>
               <table className="table">
                 <thead><tr><th>Name</th><th>Role</th><th>PIN</th><th></th></tr></thead>
                 <tbody>
@@ -1784,7 +2152,7 @@ function LaundryApp() {
                       <tr key={u.id} className="cust-edit-row">
                         <td><input value={userEdit.name} aria-label="Name" onChange={(e) => setUserEdit({ ...userEdit, name: e.target.value })} /></td>
                         <td><span className={"chip " + (u.role === "admin" ? "role-admin" : "role-staff")}>{u.role === "admin" ? "Owner" : "Staff"}</span></td>
-                        <td><input value={userEdit.pin} inputMode="numeric" maxLength={6} aria-label="New PIN (4–6 digits)" className="pin-cell"
+                        <td><input value={userEdit.pin} inputMode="numeric" maxLength={6} placeholder="New PIN" aria-label="New PIN, 4 to 6 digits — leave blank to keep the current one" className="pin-cell"
                           onChange={(e) => setUserEdit({ ...userEdit, pin: e.target.value.replace(/\D/g, "") })} /></td>
                         <td>
                           <div className="dash-acts">
@@ -1797,10 +2165,10 @@ function LaundryApp() {
                       <tr key={u.id}>
                         <td>{u.name}{u.id === currentUserId ? " (you)" : ""}</td>
                         <td><span className={"chip " + (u.role === "admin" ? "role-admin" : "role-staff")}>{u.role === "admin" ? "Owner" : "Staff"}</span></td>
-                        <td className="pin-cell">{showPins ? u.pin : "••••"}</td>
+                        <td className="pin-cell">••••</td>
                         <td>
                           <div className="dash-acts">
-                            <button className="btn-ghost small" onClick={() => setUserEdit({ id: u.id, name: u.name, pin: u.pin })}>✏️ Edit</button>
+                            <button className="btn-ghost small" onClick={() => setUserEdit({ id: u.id, name: u.name, pin: "" })}>✏️ Edit</button>
                             <button className="btn-ghost small danger" onClick={() => removeUser(u.id)}
                               disabled={u.id === currentUserId}>Remove</button>
                           </div>
@@ -1823,7 +2191,7 @@ function LaundryApp() {
                 </select>
                 <button className="btn-main small" onClick={addUser}>Add</button>
               </div>
-              <p className="tiny left">Tip: use ✏️ Edit to change a name or PIN. Every PIN must be unique — it's how the app knows who signed in.</p>
+              <p className="tiny left">Tip: use ✏️ Edit to change a name or PIN (leave the PIN box blank to keep the current one). PINs are stored securely — nobody can read them back, so if one is forgotten just set a new one. Every PIN must be unique.</p>
             </section>
           )}
           {/* ================= SETTINGS (owner only) ================= */}
@@ -1875,6 +2243,39 @@ function LaundryApp() {
                   Download a backup file automatically when the owner signs in (once a day)
                 </label>
               </div>
+
+              <div className="svc-cat">Cloud sync — share records between devices</div>
+              {!cloud ? (
+                <>
+                  <p className="muted small-note">Right now this device keeps its own records. Turn on cloud sync to store everything in your online database as well — then every connected phone or computer sees the same customers, orders and payments. The app still works offline and catches up when internet returns.</p>
+                  <div className="edit-add">
+                    <button className="btn-main small" onClick={enableCloud}>☁ Turn on cloud sync</button>
+                  </div>
+                  <p className="muted small-note">Already turned on from another device? Paste that device's link code here instead:</p>
+                  <div className="edit-add">
+                    <input value={joinCode} placeholder="Link code from the other device"
+                      aria-label="Link code from the other device"
+                      onChange={(e) => setJoinCode(e.target.value)} />
+                    <button className="btn-ghost small" onClick={joinCloud}>Connect</button>
+                  </div>
+                </>
+              ) : (
+                <>
+                  <p className="muted small-note">
+                    {syncState === "syncing" ? "Syncing…"
+                      : syncState === "offline" ? "Offline — changes are saved here and will sync when internet returns."
+                      : syncState === "error" ? "The last sync attempt failed — it will retry automatically."
+                      : cloud.lastSyncTs ? `Synced ${label(cloud.lastSyncTs)}.` : "Connected."}
+                  </p>
+                  <div className="edit-add">
+                    <button className="btn-ghost small" onClick={() => doSync()}>Sync now</button>
+                    <button className="btn-ghost small" onClick={copyLinkCode}>Copy link code (to add a device)</button>
+                    <button className="btn-ghost small danger" onClick={disconnectCloud}>Disconnect this device</button>
+                  </div>
+                  <p className="tiny left">To add a device: open the app there → Settings → paste the link code → Connect. Treat the code like a key — anyone who has it can read the shop's records.</p>
+                  <p className="tiny left link-code" aria-label="Your link code">{linkCode}</p>
+                </>
+              )}
 
               <div className="svc-cat">Payment methods</div>
               <div className="setting-list">
@@ -2418,6 +2819,15 @@ input:focus, select:focus, textarea:focus { outline: none; border-color: var(--b
 .setting-item { display: inline-flex; align-items: center; gap: 7px; background: var(--bg); border: 1px solid var(--line); border-radius: 9px; padding: 7px 8px 7px 14px; font-size: 13.5px; font-weight: 600; }
 .item-x { border: 0; background: #fff; color: var(--red); width: 26px; height: 26px; border-radius: 999px; cursor: pointer; font-size: 11px; font-weight: 700; line-height: 1; transition: background 0.12s ease; }
 .item-x:hover { background: #FEE2E2; }
+
+/* ---------- cloud sync ---------- */
+.sync-chip { font-size: 12.5px; font-weight: 700; padding: 6px 10px; border-radius: 9px; text-align: center; }
+.sync-idle { background: #DCFCE7; color: #15803D; }
+.sync-syncing { background: var(--blue-soft); color: var(--blue-dark); }
+.sync-offline { background: #FEF3C7; color: #92400E; }
+.sync-error { background: #FEE2E2; color: var(--red); }
+.link-code { font-family: 'IBM Plex Mono', monospace; word-break: break-all; user-select: all; background: var(--bg); padding: 8px 10px; border-radius: 8px; }
+.show-more { display: block; width: 100%; margin-top: 4px; }
 
 /* ---------- footer ---------- */
 .ft { text-align: center; font-size: 12px; color: var(--muted); padding: 14px 12px 18px; }
